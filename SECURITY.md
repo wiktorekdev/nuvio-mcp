@@ -66,8 +66,9 @@ Applied to `nuvio_delete_profile`, `nuvio_restore_backup`, `nuvio_revoke_session
 
 ## Snapshot integrity
 
-A reversible mutation only runs after its pre-change snapshot is durably written (temp file, fsync,
-atomic rename, mode `0600`). If the snapshot cannot be persisted the mutation is refused. When a
+When snapshots are enabled, a reversible mutation only runs after its pre-change snapshot is durably
+written (temp file, fsync, atomic rename, mode `0600`). If the snapshot cannot be persisted the
+mutation is refused. When a
 snapshot records the identities a change touched, restore only affects those identities and leaves
 unrelated items alone. Snapshots from older versions that predate this do not carry that information
 and are restored as a full resource. Snapshot ids are validated before touching the filesystem, so a

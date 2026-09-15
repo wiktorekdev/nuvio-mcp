@@ -113,11 +113,14 @@ docker run --rm -p 3333:3333 \
 
 - Reversible changes are snapshotted first and can be reverted with `nuvio_undo` / `nuvio_redo`.
 - Irreversible operations use two-step confirmation.
-- Secrets are masked in tool output.
-- Set `NUVIO_DISABLE_SNAPSHOTS=true` to write no snapshots at all (no undo, no local secrets).
+- Known secret fields are masked in tool output.
+- Set `NUVIO_DISABLE_SNAPSHOTS=true` to write no snapshots at all (no undo and no secrets stored in
+  snapshots).
 
 Snapshots are cleaned up automatically (age, count and total size). Old snapshots can also be
 removed on demand with `nuvio_prune_snapshots`. See [`.env.example`](.env.example) for the limits.
+
+See [SECURITY.md](SECURITY.md) for the full security model.
 
 ## Batched changes: `nuvio_apply_plan`
 

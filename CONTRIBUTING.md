@@ -40,8 +40,8 @@ bash test/docker-smoke.sh   # optional, needs Docker
 - Read resources through `client.readRpc` / `client.select`.
 - Tool argument schemas live in `src/nuvio/schemas.ts`. `nuvio_apply_plan` validates operations with
   the same schemas as the direct tools, so keep them in sync.
-- When a tool changes shape, keep the old name working as a deprecated alias (`canonical: false`,
-  `replacement: '...'`) instead of removing it.
+- Avoid breaking tool schemas. When replacing a tool, keep a deprecated compatibility alias
+  (`canonical: false`, `replacement: '...'`) where practical.
 - New behavior needs a test.
 
 ## Project layout
