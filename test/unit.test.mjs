@@ -9,6 +9,7 @@ import { VERSION } from '../dist/version.js';
 import { ConfirmationGate } from '../dist/nuvio/confirm.js';
 import { getSnapshot, removeSnapshot } from '../dist/nuvio/snapshots.js';
 import { fetchJsonFromPublicUrl, isPrivateAddress } from '../dist/nuvio/safe-fetch.js';
+import { loadConfig } from '../dist/config.js';
 
 test('server version comes from package.json (single source of truth)', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -169,6 +170,34 @@ test('fetchJsonFromPublicUrl refuses loopback, private and non-http targets', as
     /private\/loopback/
   );
   await assert.rejects(() => fetchJsonFromPublicUrl('file:///etc/passwd'), /http\(s\)/);
+});
+
+test('config accepts 0 for snapshot retention limits (0 = disabled)', () => {
+  const keys = ['NUVIO_SNAPSHOT_MAX_AGE_DAYS', 'NUVIO_SNAPSHOT_MAX_COUNT', 'NUVIO_SNAPSHOT_MAX_TOTAL_BYTES'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) process.env[k] = '0';
+  try {
+    const cfg = loadConfig();
+    assert.equal(cfg.snapshotMaxAgeDays, 0);
+    assert.equal(cfg.snapshotMaxCount, 0);
+    assert.equal(cfg.snapshotMaxTotalBytes, 0);
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  }
+});
+
+test('config still rejects 0 where it is not a valid value', () => {
+  const prev = process.env.NUVIO_HTTP_PORT;
+  process.env.NUVIO_HTTP_PORT = '0';
+  try {
+    assert.equal(loadConfig().http.port, 3333);
+  } finally {
+    if (prev === undefined) delete process.env.NUVIO_HTTP_PORT;
+    else process.env.NUVIO_HTTP_PORT = prev;
+  }
 });
 
 test('NuvioClient retries a 429 and then succeeds', async () => {

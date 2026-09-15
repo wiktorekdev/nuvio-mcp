@@ -87,6 +87,12 @@ function int(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** Like `int`, but `0` is a valid value (used where 0 means "disabled"). */
+function nonNegativeInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export function loadConfig(): NuvioConfig {
   loadEnvFiles();
 
@@ -111,9 +117,9 @@ export function loadConfig(): NuvioConfig {
     snapshotDir: process.env.NUVIO_SNAPSHOT_DIR?.trim() || join(dataDir, 'snapshots'),
     backendTimeoutMs: int(process.env.NUVIO_BACKEND_TIMEOUT_MS, 30_000),
     disableSnapshots: bool(process.env.NUVIO_DISABLE_SNAPSHOTS, false),
-    snapshotMaxAgeDays: int(process.env.NUVIO_SNAPSHOT_MAX_AGE_DAYS, 30),
-    snapshotMaxCount: int(process.env.NUVIO_SNAPSHOT_MAX_COUNT, 250),
-    snapshotMaxTotalBytes: int(process.env.NUVIO_SNAPSHOT_MAX_TOTAL_BYTES, 50 * 1024 * 1024),
+    snapshotMaxAgeDays: nonNegativeInt(process.env.NUVIO_SNAPSHOT_MAX_AGE_DAYS, 30),
+    snapshotMaxCount: nonNegativeInt(process.env.NUVIO_SNAPSHOT_MAX_COUNT, 250),
+    snapshotMaxTotalBytes: nonNegativeInt(process.env.NUVIO_SNAPSHOT_MAX_TOTAL_BYTES, 50 * 1024 * 1024),
     transport,
     http: {
       host: process.env.NUVIO_HTTP_HOST?.trim() || '127.0.0.1',
