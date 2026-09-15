@@ -103,8 +103,8 @@ export const providerSetShape = {
 export const providerDeleteShape = { profile_id: profile, provider: z.string() };
 
 export const libraryItemSchema = z.object({
-  content_id: z.string(),
-  content_type: z.string(),
+  content_id: z.string().min(1),
+  content_type: z.string().min(1),
   name: z.string().nullable().optional(),
   poster: z.string().nullable().optional(),
   poster_shape: z.string().nullable().optional(),
@@ -119,17 +119,17 @@ export const libraryItemSchema = z.object({
 export const libraryAddShape = { profile_id: profile, items: z.array(libraryItemSchema).min(1) };
 export const libraryRemoveShape = {
   profile_id: profile,
-  keys: z.array(z.object({ content_id: z.string(), content_type: z.string() })).min(1),
+  keys: z.array(z.object({ content_id: z.string().min(1), content_type: z.string().min(1) })).min(1),
 };
 
 export const progressKeySchema = z.object({
-  content_id: z.string(),
+  content_id: z.string().min(1),
   season: z.number().int().nullable().optional(),
   episode: z.number().int().nullable().optional(),
 });
 export const progressEntrySchema = z.object({
-  content_id: z.string(),
-  content_type: z.string(),
+  content_id: z.string().min(1),
+  content_type: z.string().min(1),
   video_id: z.string().nullable().optional(),
   season: z.number().int().nullable().optional(),
   episode: z.number().int().nullable().optional(),
@@ -141,8 +141,8 @@ export const progressSetShape = { profile_id: profile, entries: z.array(progress
 export const progressDeleteShape = { profile_id: profile, keys: z.array(progressKeySchema).min(1) };
 
 export const historyItemSchema = z.object({
-  content_id: z.string(),
-  content_type: z.string(),
+  content_id: z.string().min(1),
+  content_type: z.string().min(1),
   title: z.string().nullable().optional(),
   season: z.number().int().nullable().optional(),
   episode: z.number().int().nullable().optional(),

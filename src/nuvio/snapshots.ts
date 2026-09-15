@@ -16,6 +16,7 @@ import type { NuvioConfig } from '../config.js';
 import type { NuvioClient } from './client.js';
 import { NuvioError } from './errors.js';
 import { readAllLibrary, readAllWatchHistory, readAllWatchProgress } from './ops/readers.js';
+import { historyKeyOf, libraryKeyOf, storedProgressKey } from './keys.js';
 
 /** Thrown when a mandatory pre-mutation snapshot cannot be persisted. */
 export class SnapshotError extends Error {
@@ -188,9 +189,10 @@ function persist(cfg: NuvioConfig, snapshot: Snapshot): void {
         'The change was not applied.'
     );
   }
-  // Best-effort retention: never let a runaway snapshot directory grow unbounded.
+  // Best-effort retention. keepLast=1 protects the snapshot just written; the
+  // age/count/size limits still apply to everything else.
   try {
-    pruneSnapshots(cfg, {});
+    pruneSnapshots(cfg, { keepLast: 1 });
   } catch {
     /* retention is best-effort */
   }
@@ -214,11 +216,11 @@ export interface PruneResult {
 
 /** Delete old/large snapshots according to the retention limits. */
 export function pruneSnapshots(cfg: NuvioConfig, options: PruneOptions = {}): PruneResult {
-  // Three independent limits. `keep_last` is NOT the count limit; it defaults to
-  // 0 so age and size limits stay effective. The newest snapshot is always kept
-  // so a GC pass can never delete the snapshot it was just written for.
+  // Three independent limits (age, count, size). `keep_last` defaults to 0:
+  // it protects nothing unless a caller explicitly asks for it. Automatic GC
+  // passes keepLast=1 itself so it never deletes the snapshot it just wrote.
   const olderThanDays = options.olderThanDays ?? cfg.snapshotMaxAgeDays;
-  const keepLast = Math.max(options.keepLast ?? 0, 1);
+  const keepLast = options.keepLast ?? 0;
   const maxCount = options.maxCount ?? cfg.snapshotMaxCount;
   const maxTotalBytes = options.maxTotalBytes ?? cfg.snapshotMaxTotalBytes;
 
@@ -407,7 +409,8 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
     case 'library':
       return readAllLibrary(client, ref.profile_id);
     case 'watch_progress':
-      return readAllWatchProgress(client, ref.profile_id);
+      // Progress has no pagination contract; refuse a snapshot we cannot prove complete.
+      return readAllWatchProgress(client, ref.profile_id, { requireComplete: true });
     case 'watch_history':
       return readAllWatchHistory(client, ref.profile_id);
     case 'provider_credentials':
@@ -551,9 +554,22 @@ export async function restoreResource(
       return `Restored collections for profile ${r.profile_id}.`;
     case 'library': {
       const beforeRows = before as Array<Record<string, unknown>>;
-      const scope = (entry.scope as Array<{ content_id: string; content_type: string }> | undefined) ?? [];
-      const beforeKeys = new Set(beforeRows.map((i) => `${i.content_type}:${i.content_id}`));
-      const remove = scope.filter((k) => !beforeKeys.has(`${k.content_type}:${k.content_id}`));
+      const scope = entry.scope as Array<{ content_id: string; content_type: string }> | undefined;
+      const beforeKeys = new Set(beforeRows.map((i) => libraryKeyOf(i as never)));
+      if (scope === undefined) {
+        // Legacy snapshot without scope: restore the whole resource.
+        if (beforeRows.length > 0) {
+          await client.rpc('sync_push_library_items', {
+            p_profile_id: r.profile_id,
+            p_items: strip(beforeRows, LIBRARY_FIELDS),
+            p_origin_client_id: origin,
+          });
+        }
+        return `Restored the library for profile ${r.profile_id}.`;
+      }
+      const scopeKeys = new Set(scope.map((k) => libraryKeyOf(k)));
+      const scopedBefore = beforeRows.filter((i) => scopeKeys.has(libraryKeyOf(i as never)));
+      const remove = scope.filter((k) => !beforeKeys.has(libraryKeyOf(k)));
       if (remove.length > 0) {
         await client.rpc('sync_delete_library_items', {
           p_profile_id: r.profile_id,
@@ -561,19 +577,31 @@ export async function restoreResource(
           p_origin_client_id: origin,
         });
       }
-      if (beforeRows.length > 0) {
+      if (scopedBefore.length > 0) {
         await client.rpc('sync_push_library_items', {
           p_profile_id: r.profile_id,
-          p_items: strip(beforeRows, LIBRARY_FIELDS),
+          p_items: strip(scopedBefore, LIBRARY_FIELDS),
           p_origin_client_id: origin,
         });
       }
-      return `Restored the library for profile ${r.profile_id}.`;
+      return `Restored the library for profile ${r.profile_id} (${scopedBefore.length} scoped item(s)).`;
     }
     case 'watch_progress': {
       const beforeRows = before as Array<Record<string, unknown>>;
-      const scope = (entry.scope as string[] | undefined) ?? [];
-      const beforeKeys = new Set(beforeRows.map((p) => progressKeyOf(p)));
+      const scope = entry.scope as string[] | undefined;
+      const beforeKeys = new Set(beforeRows.map((p) => storedProgressKey(p)));
+      if (scope === undefined) {
+        if (beforeRows.length > 0) {
+          await client.rpc('sync_push_watch_progress', {
+            p_profile_id: r.profile_id,
+            p_entries: strip(beforeRows, PROGRESS_FIELDS),
+            p_origin_client_id: origin,
+          });
+        }
+        return `Restored watch progress for profile ${r.profile_id}.`;
+      }
+      const scopeKeys = new Set(scope);
+      const scopedBefore = beforeRows.filter((p) => scopeKeys.has(storedProgressKey(p)));
       const remove = scope.filter((key) => !beforeKeys.has(key));
       if (remove.length > 0) {
         await client.rpc('sync_delete_watch_progress', {
@@ -582,20 +610,32 @@ export async function restoreResource(
           p_origin_client_id: origin,
         });
       }
-      if (beforeRows.length > 0) {
+      if (scopedBefore.length > 0) {
         await client.rpc('sync_push_watch_progress', {
           p_profile_id: r.profile_id,
-          p_entries: strip(beforeRows, PROGRESS_FIELDS),
+          p_entries: strip(scopedBefore, PROGRESS_FIELDS),
           p_origin_client_id: origin,
         });
       }
-      return `Restored watch progress for profile ${r.profile_id}.`;
+      return `Restored watch progress for profile ${r.profile_id} (${scopedBefore.length} scoped entry(ies)).`;
     }
     case 'watch_history': {
       const beforeRows = before as Array<Record<string, unknown>>;
-      const scope = (entry.scope as Array<Record<string, unknown>> | undefined) ?? [];
-      const beforeKeys = new Set(beforeRows.map((i) => historyKeyOf(i)));
-      const remove = scope.filter((k) => !beforeKeys.has(historyKeyOf(k)));
+      const scope = entry.scope as Array<Record<string, unknown>> | undefined;
+      const beforeKeys = new Set(beforeRows.map((i) => historyKeyOf(i as never)));
+      if (scope === undefined) {
+        if (beforeRows.length > 0) {
+          await client.rpc('sync_push_watched_items', {
+            p_profile_id: r.profile_id,
+            p_items: strip(beforeRows, HISTORY_FIELDS),
+            p_origin_client_id: origin,
+          });
+        }
+        return `Restored watch history for profile ${r.profile_id}.`;
+      }
+      const scopeKeys = new Set(scope.map((k) => historyKeyOf(k as never)));
+      const scopedBefore = beforeRows.filter((i) => scopeKeys.has(historyKeyOf(i as never)));
+      const remove = scope.filter((k) => !beforeKeys.has(historyKeyOf(k as never)));
       if (remove.length > 0) {
         await client.rpc('sync_delete_watched_items', {
           p_profile_id: r.profile_id,
@@ -607,14 +647,14 @@ export async function restoreResource(
           p_origin_client_id: origin,
         });
       }
-      if (beforeRows.length > 0) {
+      if (scopedBefore.length > 0) {
         await client.rpc('sync_push_watched_items', {
           p_profile_id: r.profile_id,
-          p_items: strip(beforeRows, HISTORY_FIELDS),
+          p_items: strip(scopedBefore, HISTORY_FIELDS),
           p_origin_client_id: origin,
         });
       }
-      return `Restored watch history for profile ${r.profile_id}.`;
+      return `Restored watch history for profile ${r.profile_id} (${scopedBefore.length} scoped item(s)).`;
     }
     case 'provider_credentials': {
       const current = await client.rpc<Array<{ provider: string }>>('sync_pull_provider_credentials', {
@@ -737,15 +777,6 @@ export async function restoreResource(
     default:
       throw new NuvioError(`No automatic revert available for resource "${(r as ResourceRef).kind}".`);
   }
-}
-
-function progressKeyOf(p: Record<string, unknown>): string {
-  if (typeof p.progress_key === 'string' && p.progress_key) return p.progress_key;
-  return p.season != null ? `${p.content_id}_s${p.season}e${p.episode}` : String(p.content_id);
-}
-
-function historyKeyOf(i: Record<string, unknown>): string {
-  return `${i.content_id}|${i.season ?? -1}|${i.episode ?? -1}`;
 }
 
 function secondsUntil(expiresAt: unknown): number {

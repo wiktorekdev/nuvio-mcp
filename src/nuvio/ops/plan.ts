@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { NuvioError } from '../errors.js';
 import type { NuvioClient } from '../client.js';
+import { libraryKeyOf, progressKeyOf, storedProgressKey } from '../keys.js';
 import { readResource, type ResourceRef, type SnapshotResourceEntry } from '../snapshots.js';
 import {
   addonAddShape,
@@ -20,14 +21,23 @@ import {
 } from '../schemas.js';
 import {
   applySettingsEdit,
+  assertEditProvided,
   diffTree,
+  getHomeCatalogSettings,
   getSettings,
   isConcurrencyConflict,
   writeSettings,
-  getHomeCatalogSettings,
   type SettingsPatch,
 } from './settings.js';
 import { PROVIDER_CREDENTIAL_FIELD } from './providers.js';
+import {
+  planHistoryAdd,
+  planHistoryDelete,
+  planLibraryAdd,
+  planLibraryRemove,
+  planProgressDelete,
+  planProgressSet,
+} from './transitions.js';
 
 export interface PlanOperation {
   tool: string;
@@ -61,7 +71,7 @@ export interface PlanResult {
   snapshot_id?: string;
 }
 
-/** A writer failure, with the side-effect information the plan needs to classify it. */
+/** A writer failure plus the side-effect information the plan needs to classify it. */
 export class WriteFailure extends Error {
   constructor(
     message: string,
@@ -82,18 +92,25 @@ interface ResourceState {
 }
 
 interface Descriptor {
-  /** Canonical Zod schema — identical to the one the direct tool registers. */
   schema: z.ZodRawShape;
-  /** Handler-level validation shared with the direct tool. */
   validate?: (args: Record<string, unknown>) => void;
   ref(args: Record<string, unknown>): ResourceRef;
   scope?(args: Record<string, unknown>): unknown[];
-  plan(state: unknown, args: Record<string, unknown>): { state: unknown; diff: string[] };
+  plan(state: unknown, args: Record<string, unknown>, now: number): { state: unknown; diff: string[] };
   readMeta?(client: NuvioClient, ref: ResourceRef): Promise<Record<string, unknown>>;
   write(
     client: NuvioClient,
     ref: ResourceRef,
     state: unknown,
+    meta: Record<string, unknown>,
+    originId: string
+  ): Promise<Record<string, unknown> | void>;
+  /** Guarded rollback for resources with optimistic concurrency. */
+  guardedRollback?: (meta: Record<string, unknown>) => boolean;
+  rollback?(
+    client: NuvioClient,
+    ref: ResourceRef,
+    before: unknown,
     meta: Record<string, unknown>,
     originId: string
   ): Promise<void>;
@@ -103,28 +120,16 @@ function copy<T>(value: T): T {
   return structuredClone(value);
 }
 
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical);
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      out[key] = canonical((value as Record<string, unknown>)[key]);
-    }
-    return out;
-  }
-  return value;
-}
-
-function same(a: unknown, b: unknown): boolean {
-  return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
-}
-
 export function resourceKey(ref: ResourceRef): string {
   const r = ref as { kind: string; profile_id?: number; platform?: string };
   return `${r.kind}${r.profile_id !== undefined ? `:${r.profile_id}` : ''}${r.platform ? `/${r.platform}` : ''}`;
 }
 
-/** Apply list upserts/removes with partial-write awareness. */
+/**
+ * Apply list upserts/removes. Any write RPC that has *started* may have been
+ * applied on the backend even if it later throws (timeout, reset response, 5xx
+ * after commit), so failures are conservatively marked `mayHaveApplied: true`.
+ */
 async function pushList(
   client: NuvioClient,
   ref: ResourceRef,
@@ -143,31 +148,31 @@ async function pushList(
   const a = new Map(after.map((i) => [keyOf(i), i]));
   const upserts = after.filter((i) => {
     const prev = b.get(keyOf(i));
-    return !prev || !same(prev, i);
+    return !prev || JSON.stringify(prev) !== JSON.stringify(i);
   });
   const removals = before.filter((i) => !a.has(keyOf(i)));
 
-  let wroteSomething = false;
+  let writeAttempted = false;
   try {
     if (removals.length > 0) {
+      writeAttempted = true;
       await client.rpc(deleteRpc, {
         p_profile_id: profileId,
         [deleteField]: removals.map(mapDeleteKey),
         p_origin_client_id: originId,
       });
-      wroteSomething = true;
     }
     if (upserts.length > 0) {
+      writeAttempted = true;
       await client.rpc(upsertRpc, {
         p_profile_id: profileId,
         [upsertField]: upserts,
         p_origin_client_id: originId,
       });
-      wroteSomething = true;
     }
   } catch (error) {
     throw new WriteFailure(error instanceof Error ? error.message : String(error), {
-      mayHaveApplied: wroteSomething,
+      mayHaveApplied: writeAttempted,
     });
   }
 }
@@ -176,7 +181,7 @@ async function pushList(
 // Planners (canonical plan-supported tools only)
 // ---------------------------------------------------------------------------
 
-function settingsPlan(state: unknown, args: Record<string, unknown>): { state: unknown; diff: string[] } {
+function settingsPlan(state: unknown, args: Record<string, unknown>, _now: number) {
   const edit: SettingsPatch = {
     patch: args.patch as Record<string, unknown> | undefined,
     set: args.set as Array<{ path: string; value: unknown }> | undefined,
@@ -188,6 +193,12 @@ function settingsPlan(state: unknown, args: Record<string, unknown>): { state: u
 
 const settingsDescriptor: Descriptor = {
   schema: updateSettingsShape,
+  validate: (args) =>
+    assertEditProvided({
+      patch: args.patch as Record<string, unknown> | undefined,
+      set: args.set as Array<{ path: string; value: unknown }> | undefined,
+      unset: args.unset as string[] | undefined,
+    }),
   ref: (args) => ({
     kind: 'settings',
     profile_id: args.profile_id as number,
@@ -202,7 +213,7 @@ const settingsDescriptor: Descriptor = {
   write: async (client, ref, state, meta, originId) => {
     const r = ref as { profile_id: number; platform: string };
     try {
-      await writeSettings(
+      const result = await writeSettings(
         client,
         r.profile_id,
         r.platform,
@@ -210,6 +221,7 @@ const settingsDescriptor: Descriptor = {
         (meta.updated_at as string | null) ?? null,
         originId
       );
+      return { writtenRevision: result.revision, writtenGuarded: result.guarded };
     } catch (error) {
       if (isConcurrencyConflict(error)) {
         throw new WriteFailure(
@@ -222,10 +234,36 @@ const settingsDescriptor: Descriptor = {
       });
     }
   },
+  guardedRollback: (meta) => Boolean(meta.writtenGuarded) && Boolean(meta.writtenRevision),
+  rollback: async (client, ref, before, meta, originId) => {
+    const r = ref as { profile_id: number; platform: string };
+    try {
+      // Guarded rollback: only succeeds if nobody changed the settings after us.
+      await writeSettings(
+        client,
+        r.profile_id,
+        r.platform,
+        before as Record<string, unknown>,
+        meta.writtenRevision as string,
+        originId
+      );
+    } catch (error) {
+      throw new WriteFailure(error instanceof Error ? error.message : String(error), {
+        mayHaveApplied: true,
+        conflict: isConcurrencyConflict(error),
+      });
+    }
+  },
 };
 
 const homeDescriptor: Descriptor = {
   schema: updateSettingsShape,
+  validate: (args) =>
+    assertEditProvided({
+      patch: args.patch as Record<string, unknown> | undefined,
+      set: args.set as Array<{ path: string; value: unknown }> | undefined,
+      unset: args.unset as string[] | undefined,
+    }),
   ref: (args) => ({
     kind: 'home_catalog_settings',
     profile_id: args.profile_id as number,
@@ -372,29 +410,29 @@ const providersDescriptor: Descriptor = {
     const before = (await readResource(client, ref)) as Array<{ provider: string }>;
     const wanted = new Set((state as Array<{ provider: string }>).map((c) => c.provider));
     const rows = state as Array<{ provider: string; credential_json: unknown }>;
-    let wroteSomething = false;
+    let writeAttempted = false;
     try {
       for (const cred of before) {
         if (!wanted.has(cred.provider)) {
+          writeAttempted = true;
           await client.rpc('sync_delete_provider_credentials', {
             p_profile_id: profileId,
             p_provider: cred.provider,
             p_origin_client_id: originId,
           });
-          wroteSomething = true;
         }
       }
       if (rows.length > 0) {
+        writeAttempted = true;
         await client.rpc('sync_push_provider_credentials', {
           p_profile_id: profileId,
           p_credentials: rows,
           p_origin_client_id: originId,
         });
-        wroteSomething = true;
       }
     } catch (error) {
       throw new WriteFailure(error instanceof Error ? error.message : String(error), {
-        mayHaveApplied: wroteSomething,
+        mayHaveApplied: writeAttempted,
       });
     }
   },
@@ -410,29 +448,18 @@ const libraryDescriptor: Descriptor = {
     >;
     return items.map((i) => ({ content_id: i.content_id, content_type: i.content_type }));
   },
-  plan: (state, args) => {
+  plan: (state, args, now) => {
     const tool = String(args.__tool);
-    const list = copy(state as Array<Record<string, unknown>>);
-    const diff: string[] = [];
-    if (tool === 'nuvio_add_to_library') {
-      for (const raw of args.items as Array<Record<string, unknown>>) {
-        const key = `${raw.content_type}:${raw.content_id}`;
-        const index = list.findIndex((i) => `${i.content_type}:${i.content_id}` === key);
-        if (index >= 0) list[index] = { ...list[index], ...raw };
-        else list.push(raw);
-        diff.push(`~ library ${key}`);
-      }
-    } else if (tool === 'nuvio_remove_from_library') {
-      for (const raw of args.keys as Array<Record<string, unknown>>) {
-        const key = `${raw.content_type}:${raw.content_id}`;
-        const index = list.findIndex((i) => `${i.content_type}:${i.content_id}` === key);
-        if (index >= 0) list.splice(index, 1);
-        diff.push(`- library ${key}`);
-      }
-    } else {
-      throw new NuvioError(`Unsupported library operation: ${tool}`);
-    }
-    return { state: list, diff };
+    const list = state as Array<Record<string, unknown>>;
+    const t =
+      tool === 'nuvio_add_to_library'
+        ? planLibraryAdd(list, args.items as never, now)
+        : tool === 'nuvio_remove_from_library'
+          ? planLibraryRemove(list, args.keys as never)
+          : null;
+    if (!t) throw new NuvioError(`Unsupported library operation: ${tool}`);
+    return { state: t.after, diff: t.diff };
+    throw new NuvioError(`Unsupported library operation: ${tool}`);
   },
   write: async (client, ref, state, _meta, originId) => {
     await pushList(
@@ -440,7 +467,7 @@ const libraryDescriptor: Descriptor = {
       ref,
       (await readResource(client, ref)) as Array<Record<string, unknown>>,
       state as Array<Record<string, unknown>>,
-      (i) => `${i.content_type}:${i.content_id}`,
+      (i) => libraryKeyOf(i as never),
       'sync_push_library_items',
       'p_items',
       'sync_delete_library_items',
@@ -451,10 +478,6 @@ const libraryDescriptor: Descriptor = {
   },
 };
 
-function progressKey(i: Record<string, unknown>): string {
-  return i.season != null ? `${i.content_id}_s${i.season}e${i.episode}` : String(i.content_id);
-}
-
 const progressDescriptor: Descriptor = {
   schema: progressSetShape,
   ref: (args) => ({ kind: 'watch_progress', profile_id: args.profile_id as number }),
@@ -463,31 +486,20 @@ const progressDescriptor: Descriptor = {
     const items = (tool === 'nuvio_set_watch_progress' ? args.entries : args.keys) as Array<
       Record<string, unknown>
     >;
-    return items.map((i) => progressKey(i));
+    return items.map((i) => progressKeyOf(i as never));
   },
-  plan: (state, args) => {
+  plan: (state, args, now) => {
     const tool = String(args.__tool);
-    const list = copy(state as Array<Record<string, unknown>>);
-    const diff: string[] = [];
-    if (tool === 'nuvio_set_watch_progress') {
-      for (const raw of args.entries as Array<Record<string, unknown>>) {
-        const key = progressKey(raw);
-        const index = list.findIndex((i) => progressKey(i) === key);
-        if (index >= 0) list[index] = { ...list[index], ...raw };
-        else list.push(raw);
-        diff.push(`~ progress ${key}`);
-      }
-    } else if (tool === 'nuvio_delete_watch_progress') {
-      for (const raw of args.keys as Array<Record<string, unknown>>) {
-        const key = progressKey(raw);
-        const index = list.findIndex((i) => progressKey(i) === key);
-        if (index >= 0) list.splice(index, 1);
-        diff.push(`- progress ${key}`);
-      }
-    } else {
-      throw new NuvioError(`Unsupported watch progress operation: ${tool}`);
-    }
-    return { state: list, diff };
+    const list = state as Array<Record<string, unknown>>;
+    const t =
+      tool === 'nuvio_set_watch_progress'
+        ? planProgressSet(list, args.entries as never, now)
+        : tool === 'nuvio_delete_watch_progress'
+          ? planProgressDelete(list, args.keys as never)
+          : null;
+    if (!t) throw new NuvioError(`Unsupported watch progress operation: ${tool}`);
+    return { state: t.after, diff: t.diff };
+    throw new NuvioError(`Unsupported watch progress operation: ${tool}`);
   },
   write: async (client, ref, state, _meta, originId) => {
     await pushList(
@@ -495,20 +507,16 @@ const progressDescriptor: Descriptor = {
       ref,
       (await readResource(client, ref)) as Array<Record<string, unknown>>,
       state as Array<Record<string, unknown>>,
-      (i) => (typeof i.progress_key === 'string' && i.progress_key ? i.progress_key : progressKey(i)),
+      (i) => storedProgressKey(i),
       'sync_push_watch_progress',
       'p_entries',
       'sync_delete_watch_progress',
       'p_keys',
-      (i) => i.progress_key ?? progressKey(i),
+      (i) => storedProgressKey(i),
       originId
     );
   },
 };
-
-function historyKey(i: Record<string, unknown>): string {
-  return `${i.content_id}|${i.season ?? -1}|${i.episode ?? -1}`;
-}
 
 const historyDescriptor: Descriptor = {
   schema: historyAddShape,
@@ -524,29 +532,18 @@ const historyDescriptor: Descriptor = {
       episode: i.episode ?? null,
     }));
   },
-  plan: (state, args) => {
+  plan: (state, args, now) => {
     const tool = String(args.__tool);
-    const list = copy(state as Array<Record<string, unknown>>);
-    const diff: string[] = [];
-    if (tool === 'nuvio_add_to_watch_history') {
-      for (const raw of args.items as Array<Record<string, unknown>>) {
-        const key = historyKey(raw);
-        const index = list.findIndex((i) => historyKey(i) === key);
-        if (index >= 0) list[index] = { ...list[index], ...raw };
-        else list.push(raw);
-        diff.push(`~ watched ${key}`);
-      }
-    } else if (tool === 'nuvio_delete_watch_history') {
-      for (const raw of args.keys as Array<Record<string, unknown>>) {
-        const key = historyKey(raw);
-        const index = list.findIndex((i) => historyKey(i) === key);
-        if (index >= 0) list.splice(index, 1);
-        diff.push(`- watched ${key}`);
-      }
-    } else {
-      throw new NuvioError(`Unsupported watch history operation: ${tool}`);
-    }
-    return { state: list, diff };
+    const list = state as Array<Record<string, unknown>>;
+    const t =
+      tool === 'nuvio_add_to_watch_history'
+        ? planHistoryAdd(list, args.items as never, now)
+        : tool === 'nuvio_delete_watch_history'
+          ? planHistoryDelete(list, args.keys as never)
+          : null;
+    if (!t) throw new NuvioError(`Unsupported watch history operation: ${tool}`);
+    return { state: t.after, diff: t.diff };
+    throw new NuvioError(`Unsupported watch history operation: ${tool}`);
   },
   write: async (client, ref, state, _meta, originId) => {
     await pushList(
@@ -554,7 +551,7 @@ const historyDescriptor: Descriptor = {
       ref,
       (await readResource(client, ref)) as Array<Record<string, unknown>>,
       state as Array<Record<string, unknown>>,
-      (i) => historyKey(i),
+      (i) => `${i.content_id}|${i.season ?? -1}|${i.episode ?? -1}`,
       'sync_push_watched_items',
       'p_items',
       'sync_delete_watched_items',
@@ -565,10 +562,6 @@ const historyDescriptor: Descriptor = {
   },
 };
 
-/**
- * Canonical plan-supported operations. Only canonical tools are registered here;
- * deprecated aliases are intentionally absent (a plan rejects them).
- */
 const DESCRIPTORS: Record<string, Descriptor> = {
   nuvio_update_settings: settingsDescriptor,
   nuvio_update_home_catalog_settings: homeDescriptor,
@@ -586,7 +579,6 @@ const DESCRIPTORS: Record<string, Descriptor> = {
   nuvio_delete_watch_history: historyDescriptor,
 };
 
-/** Per-tool schema override: add/reorder/remove share a name-family default schema in the descriptor. */
 const SCHEMA_OVERRIDES: Record<string, z.ZodRawShape> = {
   nuvio_add_addon: addonAddShape,
   nuvio_update_addon: addonUpdateShape,
@@ -597,6 +589,23 @@ const SCHEMA_OVERRIDES: Record<string, z.ZodRawShape> = {
   nuvio_delete_watch_progress: progressDeleteShape,
   nuvio_delete_watch_history: historyDeleteShape,
 };
+
+/** Per-tool validation override (e.g. reorder has no url/id target to assert). */
+const VALIDATE_OVERRIDES = new Map<string, ((args: Record<string, unknown>) => void) | null>([
+  ['nuvio_reorder_addons', null],
+]);
+
+function validateFor(tool: string, descriptor: Descriptor, parsed: Record<string, unknown>): void {
+  if (VALIDATE_OVERRIDES.has(tool)) {
+    VALIDATE_OVERRIDES.get(tool)?.(parsed);
+    return;
+  }
+  descriptor.validate?.(parsed);
+}
+
+function parseArgs(tool: string, args: Record<string, unknown>): Record<string, unknown> {
+  return z.object(planSchemaFor(tool)!).parse(args) as Record<string, unknown>;
+}
 
 export function planSchemaFor(tool: string): z.ZodRawShape | undefined {
   return SCHEMA_OVERRIDES[tool] ?? DESCRIPTORS[tool]?.schema;
@@ -622,22 +631,19 @@ export function isPlanIrreversible(tool: string): boolean {
 export interface PlanDeps {
   client: NuvioClient;
   originId: string;
+  snapshotsDisabled: boolean;
   captureComposite: (entries: SnapshotResourceEntry[]) => string | undefined;
-  rollback: (entries: SnapshotResourceEntry[]) => Promise<{ ok: boolean; detail: string }>;
+  /** Restore one resource via the snapshot machinery (throws on failure). */
+  restoreEntry: (entry: SnapshotResourceEntry) => Promise<void>;
 }
 
-/**
- * Execute (or preview) a plan. Every operation is validated against the same Zod
- * schema as its direct tool; reads happen once per resource; writes happen once
- * per resource; a single composite snapshot (with per-resource scope) enables
- * rollback and undo.
- */
 export async function applyPlan(
   operations: PlanOperation[],
   dryRun: boolean,
   deps: PlanDeps
 ): Promise<PlanResult> {
   const { client } = deps;
+  const planNow = Math.floor(Date.now() / 1000);
   const perOp: PlanOperationReport[] = [];
   const states = new Map<string, ResourceState>();
   const order: string[] = [];
@@ -646,7 +652,6 @@ export async function applyPlan(
   try {
     if (operations.length === 0) throw new NuvioError('apply_plan: at least one operation is required');
 
-    // 1. Validate every operation against the canonical schema and resolve resources.
     operations.forEach((op, index) => {
       current = { index, tool: op.tool };
       if (isPlanIrreversible(op.tool)) {
@@ -658,18 +663,22 @@ export async function applyPlan(
           `apply_plan: "${op.tool}" is not supported by a plan (canonical plan-supported tools only).`
         );
       }
-      const schema = planSchemaFor(op.tool)!;
-      const parsed = z.object(schema).parse(op.args) as Record<string, unknown>;
-      descriptor.validate?.(parsed);
-      const ref = descriptor.ref(parsed);
-      const key = resourceKey(ref);
+      const parsed = parseArgs(op.tool, op.args);
+      validateFor(op.tool, descriptor, parsed);
+      const key = resourceKey(descriptor.ref(parsed));
       if (!states.has(key)) {
-        states.set(key, { ref, key, before: undefined, after: undefined, scope: undefined, meta: {} });
+        states.set(key, {
+          ref: descriptor.ref(parsed),
+          key,
+          before: undefined,
+          after: undefined,
+          scope: undefined,
+          meta: {},
+        });
         order.push(key);
       }
     });
 
-    // 2. Read each resource exactly once (and its concurrency metadata).
     for (const key of order) {
       const entry = states.get(key)!;
       entry.before = await readResource(client, entry.ref);
@@ -678,21 +687,16 @@ export async function applyPlan(
       if (descriptor.readMeta) entry.meta = await descriptor.readMeta(client, entry.ref);
     }
 
-    // 3. Plan each operation against the evolving state, unioning per-resource scope.
     operations.forEach((op, index) => {
       current = { index, tool: op.tool };
       const descriptor = DESCRIPTORS[op.tool];
-      const schema = planSchemaFor(op.tool)!;
-      const parsed = z.object(schema).parse(op.args) as Record<string, unknown>;
-      const ref = descriptor.ref(parsed);
-      const key = resourceKey(ref);
+      const parsed = parseArgs(op.tool, op.args);
+      const key = resourceKey(descriptor.ref(parsed));
       const entry = states.get(key)!;
-      const result = descriptor.plan(entry.after, { ...parsed, __tool: op.tool });
+      const result = descriptor.plan(entry.after, { ...parsed, __tool: op.tool }, planNow);
       entry.after = result.state;
-      if (descriptor.scope) {
-        const scope = descriptor.scope({ ...parsed, __tool: op.tool });
-        entry.scope = unionScope(entry.scope, scope);
-      }
+      if (descriptor.scope)
+        entry.scope = unionScope(entry.scope, descriptor.scope({ ...parsed, __tool: op.tool }));
       perOp.push({ index, tool: op.tool, resource: key, diff: result.diff });
     });
   } catch (error) {
@@ -732,7 +736,6 @@ export async function applyPlan(
     };
   }
 
-  // 4. Composite snapshot (per-resource scope), then one write per resource.
   const entries: SnapshotResourceEntry[] = order.map((key) => {
     const e = states.get(key)!;
     return { resource: e.ref, before: e.before, scope: e.scope };
@@ -754,7 +757,8 @@ export async function applyPlan(
     writePhaseStarted = true;
     attemptedResources.push(key);
     try {
-      await descriptor.write(client, entry.ref, entry.after, entry.meta, deps.originId);
+      const metaPatch = await descriptor.write(client, entry.ref, entry.after, entry.meta, deps.originId);
+      if (metaPatch) Object.assign(entry.meta, metaPatch);
       completedResources.push(key);
       for (const op of perOp) if (op.resource === key) applied.push(op.index);
     } catch (error) {
@@ -782,24 +786,21 @@ export async function applyPlan(
     };
   }
 
-  // 5. Roll back only resources that may have been modified. A guarded-write
-  //    conflict has no side effect, so it is excluded — a blind rollback would
-  //    overwrite the newer concurrent state.
-  const rollbackEntries: SnapshotResourceEntry[] = order
-    .filter((key) => {
-      if (completedResources.includes(key)) return true;
-      if (key === attemptedResources[attemptedResources.length - 1]) {
-        return failedMayHaveApplied && !failedConflict;
-      }
-      return false;
-    })
-    .map((key) => {
-      const e = states.get(key)!;
-      return { resource: e.ref, before: e.before, scope: e.scope };
-    });
+  const failedKey = attemptedResources[attemptedResources.length - 1];
+  const rollbackKeys = order.filter((key) => {
+    if (completedResources.includes(key)) return true;
+    if (key === failedKey) return failedMayHaveApplied && !failedConflict;
+    return false;
+  });
 
   let rollback: PlanResult['rollback'];
-  if (failedConflict && rollbackEntries.length === 0) {
+  if (deps.snapshotsDisabled) {
+    rollback = {
+      attempted: false,
+      successful: false,
+      detail: 'Snapshots are disabled; no rollback was attempted and the final state is unknown.',
+    };
+  } else if (failedConflict && rollbackKeys.length === 0) {
     rollback = {
       attempted: false,
       successful: false,
@@ -808,21 +809,37 @@ export async function applyPlan(
   } else if (!writePhaseStarted) {
     rollback = { attempted: false, successful: false, detail: 'No write was attempted.' };
   } else {
-    try {
-      const detail = await deps.rollback(rollbackEntries);
-      rollback = { attempted: true, successful: detail.ok, detail: detail.detail };
-    } catch (error) {
-      rollback = {
-        attempted: true,
-        successful: false,
-        detail: error instanceof Error ? error.message : String(error),
+    const outcomes: Array<{ ok: boolean; detail: string }> = [];
+    for (const key of rollbackKeys) {
+      const entry = states.get(key)!;
+      const descriptor = descriptorFor(entry.ref, operations);
+      const snapshotEntry: SnapshotResourceEntry = {
+        resource: entry.ref,
+        before: entry.before,
+        scope: entry.scope,
       };
+      try {
+        if (descriptor.rollback && descriptor.guardedRollback?.(entry.meta)) {
+          await descriptor.rollback(client, entry.ref, entry.before, entry.meta, deps.originId);
+        } else {
+          await deps.restoreEntry(snapshotEntry);
+        }
+        outcomes.push({ ok: true, detail: `ok ${key}` });
+      } catch (error) {
+        outcomes.push({
+          ok: false,
+          detail: `fail ${key}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
     }
+    const ok = outcomes.every((o) => o.ok);
+    rollback = { attempted: true, successful: ok, detail: outcomes.map((o) => o.detail).join(', ') };
   }
 
   let status: PlanStatus;
   if (!writePhaseStarted) status = 'failed_before_apply';
-  else if (failedConflict && rollbackEntries.length === 0) status = 'partially_applied';
+  else if (deps.snapshotsDisabled) status = 'partially_applied';
+  else if (failedConflict && rollbackKeys.length === 0) status = 'partially_applied';
   else if (rollback.successful) status = 'rolled_back';
   else status = 'partially_applied';
 
@@ -854,17 +871,11 @@ function unionScope(existing: unknown, next: unknown[]): unknown[] {
   return out;
 }
 
-/** Resolve the descriptor for a resource that may have several contributing tools. */
 function descriptorFor(ref: ResourceRef, operations: PlanOperation[]): Descriptor {
   const key = resourceKey(ref);
   for (const op of operations) {
     const d = DESCRIPTORS[op.tool];
-    if (
-      d &&
-      resourceKey(d.ref(z.object(planSchemaFor(op.tool)!).parse(op.args) as Record<string, unknown>)) === key
-    ) {
-      return d;
-    }
+    if (d && resourceKey(d.ref(parseArgs(op.tool, op.args))) === key) return d;
   }
   throw new NuvioError(`apply_plan: no descriptor for resource ${key}`);
 }

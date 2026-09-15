@@ -170,6 +170,43 @@ test('pruneSnapshots explicit keep_last protects the newest N', () => {
   assert.equal(readdirSync(dir).length, 3);
 });
 
+test('keep_last=0 protects nothing when limits are disabled', () => {
+  const dir = snapshotDirWith([idAgo(0, 1), idAgo(0, 2)]);
+  const result = pruneSnapshots(
+    gcCfg(dir, { snapshotMaxAgeDays: 0, snapshotMaxCount: 0, snapshotMaxTotalBytes: 0 }),
+    {
+      keepLast: 0,
+      maxCount: 0,
+    }
+  );
+  assert.equal(result.removed.length, 0);
+  assert.equal(readdirSync(dir).length, 2);
+});
+
+test('keep_last=0 with a size limit may evict even the newest snapshot', () => {
+  const dir = snapshotDirWith([idAgo(0, 1), idAgo(0, 2)]);
+  const result = pruneSnapshots(
+    gcCfg(dir, { snapshotMaxAgeDays: 0, snapshotMaxCount: 0, snapshotMaxTotalBytes: 10 }),
+    {
+      keepLast: 0,
+      maxCount: 0,
+    }
+  );
+  assert.equal(result.removed.length, 2, 'explicit keep_last=0 means no protection');
+});
+
+test('keepLast=1 protects the newest snapshot from the size limit', () => {
+  const dir = snapshotDirWith([idAgo(0, 1), idAgo(0, 2)]);
+  const result = pruneSnapshots(
+    gcCfg(dir, { snapshotMaxAgeDays: 0, snapshotMaxCount: 0, snapshotMaxTotalBytes: 10 }),
+    {
+      keepLast: 1,
+      maxCount: 0,
+    }
+  );
+  assert.equal(result.removed.length, 1, 'only the older snapshot is evicted');
+});
+
 test('pruneSnapshots combination is deterministic', () => {
   const dir = snapshotDirWith([idAgo(40, 1), idAgo(0, 2), idAgo(0, 3), idAgo(0, 4)]);
   const cfg = gcCfg(dir, { snapshotMaxAgeDays: 30, snapshotMaxCount: 2, snapshotMaxTotalBytes: 0 });

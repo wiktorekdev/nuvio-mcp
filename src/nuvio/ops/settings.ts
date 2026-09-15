@@ -105,6 +105,13 @@ export function isConcurrencyConflict(error: unknown): boolean {
   return typeof e?.message === 'string' && /changed on another device|concurrency|conflict/i.test(e.message);
 }
 
+export interface SettingsWriteResult {
+  /** Revision (updated_at) the backend returned, when it reports one. */
+  revision: string | null;
+  /** False when the backend has no guarded RPC and the unguarded fallback was used. */
+  guarded: boolean;
+}
+
 export async function writeSettings(
   client: NuvioClient,
   profileId: number,
@@ -112,14 +119,15 @@ export async function writeSettings(
   json: Record<string, unknown>,
   updatedAt: string | null,
   originId: string
-): Promise<void> {
+): Promise<SettingsWriteResult> {
   try {
-    await client.rpc('sync_push_profile_settings_blob_guarded', {
+    const result = await client.rpc<unknown>('sync_push_profile_settings_blob_guarded', {
       p_profile_id: profileId,
       p_platform: platform,
       p_settings_json: json,
       p_expected_updated_at: updatedAt,
     });
+    return { revision: typeof result === 'string' && result ? result : null, guarded: true };
   } catch (error) {
     if (isMissingFunction(error)) {
       await client.rpc('sync_push_profile_settings_blob', {
@@ -128,9 +136,9 @@ export async function writeSettings(
         p_settings_json: json,
         p_origin_client_id: originId,
       });
-    } else {
-      throw error;
+      return { revision: null, guarded: false };
     }
+    throw error;
   }
 }
 

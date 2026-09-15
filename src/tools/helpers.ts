@@ -483,6 +483,7 @@ export function definePlanMutation(server: McpServer, client: NuvioClient, cfg: 
           const result = await applyPlan(args.operations, args.dry_run !== false, {
             client,
             originId: cfg.originClientId,
+            snapshotsDisabled: cfg.disableSnapshots,
             captureComposite: (entries) =>
               cfg.disableSnapshots
                 ? undefined
@@ -492,35 +493,12 @@ export function definePlanMutation(server: McpServer, client: NuvioClient, cfg: 
                     reversible: true,
                     note: 'composite snapshot for a plan',
                   }).id,
-            rollback: async (entries) => {
-              if (cfg.disableSnapshots) {
-                return {
-                  ok: false,
-                  detail: 'Snapshots are disabled; no rollback was attempted and the final state is unknown.',
-                };
-              }
-              const outcomes: Array<{ ok: boolean; resource: string }> = [];
-              for (const entry of entries) {
-                try {
-                  const message = await restoreResource(client, cfg, entry, {
-                    id: 'nuvio_apply_plan',
-                    tool: 'nuvio_apply_plan',
-                    reversible: true,
-                  } as Snapshot);
-                  outcomes.push({ ok: true, resource: `${entry.resource.kind}:${message ? 'ok' : 'ok'}` });
-                } catch (error) {
-                  outcomes.push({
-                    ok: false,
-                    resource: `${entry.resource.kind}:${error instanceof Error ? error.message : String(error)}`,
-                  });
-                }
-              }
-              return {
-                ok: outcomes.every((o) => o.ok),
-                detail:
-                  outcomes.map((o) => `${o.ok ? 'ok' : 'fail'} ${o.resource}`).join(', ') ||
-                  'nothing to roll back',
-              };
+            restoreEntry: async (entry) => {
+              await restoreResource(client, cfg, entry, {
+                id: 'nuvio_apply_plan',
+                tool: 'nuvio_apply_plan',
+                reversible: true,
+              } as Snapshot);
             },
           });
           if (['applied', 'rolled_back', 'partially_applied'].includes(result.status)) {

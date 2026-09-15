@@ -30,7 +30,12 @@ async function captureBefore(
   if (cfg.disableSnapshots) return;
   const entries: SnapshotResourceEntry[] = [];
   for (const entry of snapshotResources(snapshot)) {
-    entries.push({ resource: entry.resource, before: await readResource(client, entry.resource) });
+    entries.push({
+      resource: entry.resource,
+      before: await readResource(client, entry.resource),
+      // Preserve the scope so a redo can target exactly the same records.
+      scope: entry.scope,
+    });
   }
   if (entries.length === 0) return;
   if (entries.length === 1) {
@@ -38,6 +43,7 @@ async function captureBefore(
       tool,
       resource: entries[0].resource,
       before: entries[0].before,
+      scope: entries[0].scope,
       reversible: true,
       note: `state before ${tool === 'nuvio_undo' ? 'undoing' : 'redoing'} ${snapshot.id}`,
     });

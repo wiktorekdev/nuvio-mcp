@@ -70,6 +70,11 @@ export function startMockNuvio() {
   const counts = {};
   const failures = new Map();
   const hooks = new Map();
+  const afterFailures = new Map();
+  const dropAfter = new Map();
+  const callCounts = new Map();
+  const onNth = new Map();
+  const failOn = new Map();
   const bump = (name) => {
     counts[name] = (counts[name] ?? 0) + 1;
   };
@@ -193,7 +198,7 @@ export function startMockNuvio() {
     sync_push_watch_progress: (a) => {
       const keyOf = (x) =>
         x.progress_key ??
-        (x.season != null ? `${x.content_id}_s${x.season}e${x.episode}` : String(x.content_id));
+        (x.season != null ? `${x.content_id}_s${x.season}e${x.episode ?? 0}` : String(x.content_id));
       const list = store.progress[a.p_profile_id] ?? [];
       for (const item of a.p_entries ?? []) {
         const key = keyOf(item);
@@ -208,14 +213,19 @@ export function startMockNuvio() {
     sync_delete_watch_progress: (a) => {
       const keyOf = (x) =>
         x.progress_key ??
-        (x.season != null ? `${x.content_id}_s${x.season}e${x.episode}` : String(x.content_id));
+        (x.season != null ? `${x.content_id}_s${x.season}e${x.episode ?? 0}` : String(x.content_id));
       const keys = new Set(a.p_keys ?? []);
       store.progress[a.p_profile_id] = (store.progress[a.p_profile_id] ?? []).filter(
         (x) => !keys.has(keyOf(x))
       );
       return undefined;
     },
-    sync_pull_watched_items: (a) => (store.history[a.p_profile_id] ?? []).slice(0, a.p_page_size ?? 100),
+    sync_pull_watched_items: (a) => {
+      const page = a.p_page ?? 1;
+      const size = a.p_page_size ?? 100;
+      const rows = store.history[a.p_profile_id] ?? [];
+      return rows.slice((page - 1) * size, page * size);
+    },
     sync_push_watched_items: (a) => {
       const list = store.history[a.p_profile_id] ?? [];
       for (const item of a.p_items ?? []) {
@@ -343,6 +353,20 @@ export function startMockNuvio() {
         const handler = rpc[name];
         if (!handler) return json(res, 404, { code: 'PGRST202', message: `Could not find function ${name}` });
         bump(name);
+        const callNumber = (callCounts.get(name) ?? 0) + 1;
+        callCounts.set(name, callNumber);
+        const nthHook = onNth.get(name);
+        if (nthHook && nthHook.has(callNumber)) {
+          const fn = nthHook.get(callNumber);
+          nthHook.delete(callNumber);
+          const args = body ? JSON.parse(body) : {};
+          fn(args);
+        }
+        const fail = failOn.get(name);
+        if (fail && fail.has(callNumber)) {
+          fail.delete(callNumber);
+          return json(res, 503, { message: `injected failure on call ${callNumber} for ${name}` });
+        }
         const hook = hooks.get(name);
         if (hook) {
           hooks.delete(name);
@@ -354,6 +378,19 @@ export function startMockNuvio() {
         try {
           const args = body ? JSON.parse(body) : {};
           const result = handler(args);
+          // Ambiguous-write simulation: the handler (and therefore the backend
+          // state) already ran, then the response fails or is dropped.
+          const afterRemaining = afterFailures.get(name) ?? 0;
+          if (afterRemaining > 0) {
+            afterFailures.set(name, afterRemaining - 1);
+            return json(res, 503, { message: `applied-then-failed for ${name}` });
+          }
+          const dropRemaining = dropAfter.get(name) ?? 0;
+          if (dropRemaining > 0) {
+            dropAfter.set(name, dropRemaining - 1);
+            res.destroy();
+            return;
+          }
           return json(res, result === undefined ? 204 : 200, result);
         } catch (error) {
           return json(res, error.status ?? 400, { code: error.code, message: error.message });
@@ -381,9 +418,27 @@ export function startMockNuvio() {
           for (const key of Object.keys(counts)) delete counts[key];
         },
         failRpc: (name, times = 1) => failures.set(name, times),
-        clearFailures: () => failures.clear(),
+        clearFailures: () => {
+          failures.clear();
+          afterFailures.clear();
+          dropAfter.clear();
+          failOn.clear();
+          onNth.clear();
+          callCounts.clear();
+        },
         once: (name, fn) => hooks.set(name, fn),
         clearHooks: () => hooks.clear(),
+        failAfterApply: (name, times = 1) => afterFailures.set(name, times),
+        dropResponseAfterApply: (name, times = 1) => dropAfter.set(name, times),
+        onCall: (name, callNumber, fn) => {
+          if (!onNth.has(name)) onNth.set(name, new Map());
+          onNth.get(name).set(callNumber, fn);
+        },
+        failOnCall: (name, callNumber) => {
+          if (!failOn.has(name)) failOn.set(name, new Set());
+          failOn.get(name).add(callNumber);
+        },
+        resetCallCounts: () => callCounts.clear(),
       });
     });
   });
