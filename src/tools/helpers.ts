@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { McpServer, ToolAnnotations } from '@modelcontextprotocol/server';
 import { z } from 'zod';
@@ -61,9 +61,18 @@ export const registry: RegisteredToolInfo[] = [];
 /** Per-process confirmation gate for irreversible operations. */
 export const confirmationGate = new ConfirmationGate();
 
+const AUDIT_MAX_BYTES = 5 * 1024 * 1024;
+
 function audit(cfg: NuvioConfig, entry: Record<string, unknown>): void {
   try {
     mkdirSync(dirname(cfg.auditFile), { recursive: true, mode: 0o700 });
+    try {
+      if (statSync(cfg.auditFile).size > AUDIT_MAX_BYTES) {
+        renameSync(cfg.auditFile, `${cfg.auditFile}.1`);
+      }
+    } catch {
+      /* the audit file does not exist yet */
+    }
     appendFileSync(
       cfg.auditFile,
       `${JSON.stringify({ ts: new Date().toISOString(), ...(maskDeep(entry) as Record<string, unknown>) })}\n`,
