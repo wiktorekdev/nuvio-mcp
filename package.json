@@ -1,0 +1,62 @@
+{
+  "name": "nuvio-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Nuvio: profiles, addons, plugins, settings, collections, providers, trackers and sessions.",
+  "type": "module",
+  "license": "MIT",
+  "author": "wiktorekdev",
+  "homepage": "https://github.com/wiktorekdev/nuvio-mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wiktorekdev/nuvio-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wiktorekdev/nuvio-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "nuvio",
+    "stremio",
+    "addons"
+  ],
+  "mcpName": "io.github.wiktorekdev/nuvio-mcp",
+  "bin": {
+    "nuvio-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run build",
+    "pretest": "npm run build",
+    "test": "node --test test/unit.test.mjs test/tools.test.mjs test/http.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/node": "^22.7.0",
+    "eslint": "^10.0.0",
+    "@eslint/js": "^10.0.0",
+    "globals": "^16.0.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}

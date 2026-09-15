@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a new tool or behavior for nuvio-mcp
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is an unofficial community project, not affiliated with Nuvio. Requests must be
+        possible with Nuvio's public API.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that is not possible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should the server do? Mention the Nuvio API/RPC if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

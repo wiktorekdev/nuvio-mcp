@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.wiktorekdev/nuvio-mcp",
+  "description": "Manage a Nuvio account (profiles, addons, plugins, settings, collections, provider credentials, trackers, sessions) from an AI agent.",
+  "title": "Nuvio",
+  "repository": {
+    "url": "https://github.com/wiktorekdev/nuvio-mcp",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "nuvio-mcp",
+      "version": "1.0.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "NUVIO_EMAIL",
+          "description": "Nuvio account email",
+          "isRequired": true
+        },
+        {
+          "name": "NUVIO_PASSWORD",
+          "description": "Nuvio account password",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "NUVIO_BACKEND_URL",
+          "description": "Nuvio backend base URL (default https://api.nuvio.tv)",
+          "default": "https://api.nuvio.tv"
+        },
+        {
+          "name": "NUVIO_TRANSPORT",
+          "description": "Transport: stdio or http",
+          "default": "stdio"
+        }
+      ]
+    }
+  ]
+}
