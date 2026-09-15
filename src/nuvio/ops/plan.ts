@@ -96,7 +96,12 @@ interface Descriptor {
   validate?: (args: Record<string, unknown>) => void;
   ref(args: Record<string, unknown>): ResourceRef;
   scope?(args: Record<string, unknown>): unknown[];
-  plan(state: unknown, args: Record<string, unknown>, now: number): { state: unknown; diff: string[] };
+  plan(
+    state: unknown,
+    args: Record<string, unknown>,
+    now: number,
+    meta: Record<string, unknown>
+  ): { state: unknown; diff: string[] };
   readMeta?(client: NuvioClient, ref: ResourceRef): Promise<Record<string, unknown>>;
   write(
     client: NuvioClient,
@@ -118,6 +123,19 @@ interface Descriptor {
 
 function copy<T>(value: T): T {
   return structuredClone(value);
+}
+
+/** Order-independent comparison for detecting concurrent changes. */
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonical((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
 }
 
 export function resourceKey(ref: ResourceRef): string {
@@ -294,14 +312,18 @@ const homeDescriptor: Descriptor = {
 
 function findAddon(
   list: Array<Record<string, unknown>>,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  meta: Record<string, unknown>
 ): Record<string, unknown> {
   if (typeof args.url === 'string') {
     const found = list.find((a) => a.url === args.url);
     if (found) return found;
   }
   if (typeof args.id === 'string') {
-    const found = list.find((a) => a.id === args.id);
+    // The list state is the push shape (no id); ids are supplied via readMeta.
+    const ids = (meta.ids ?? {}) as Record<string, string>;
+    const url = Object.keys(ids).find((u) => ids[u] === args.id);
+    const found = url ? list.find((a) => a.url === url) : undefined;
     if (found) return found;
   }
   throw new NuvioError('Addon not found');
@@ -311,7 +333,18 @@ const addonsDescriptor: Descriptor = {
   schema: addonUpdateShape,
   validate: (args) => assertTarget('nuvio_update_addon', args),
   ref: (args) => ({ kind: 'addons', profile_id: args.profile_id as number }),
-  plan: (state, args) => {
+  readMeta: async (client, ref) => {
+    const rows = await client.select<Array<Record<string, unknown>>>(
+      'addons',
+      `select=id,user_id,profile_id,url,name,enabled,sort_order,created_at,updated_at` +
+        `&profile_id=eq.${(ref as { profile_id: number }).profile_id}&order=sort_order.asc,created_at.asc`
+    );
+    const ids: Record<string, string> = {};
+    for (const row of rows)
+      if (typeof row.url === 'string' && typeof row.id === 'string') ids[row.url] = row.id;
+    return { ids };
+  },
+  plan: (state, args, _now, meta) => {
     const list = copy(state as Array<Record<string, unknown>>);
     const tool = String(args.__tool);
     const diff: string[] = [];
@@ -328,7 +361,7 @@ const addonsDescriptor: Descriptor = {
       });
       diff.push(`+ addon ${url}`);
     } else if (tool === 'nuvio_update_addon') {
-      const target = findAddon(list, args);
+      const target = findAddon(list, args, meta);
       if (args.name !== undefined) target.name = args.name;
       if (args.enabled !== undefined) target.enabled = args.enabled;
       if (args.sort_order !== undefined) target.sort_order = args.sort_order;
@@ -344,7 +377,7 @@ const addonsDescriptor: Descriptor = {
         diff: ['~ reorder addons'],
       };
     } else if (tool === 'nuvio_remove_addon') {
-      const target = findAddon(list, args);
+      const target = findAddon(list, args, meta);
       diff.push(`- addon ${String(target.url)}`);
       return { state: list.filter((a) => a.url !== target.url), diff };
     } else {
@@ -693,7 +726,7 @@ export async function applyPlan(
       const parsed = parseArgs(op.tool, op.args);
       const key = resourceKey(descriptor.ref(parsed));
       const entry = states.get(key)!;
-      const result = descriptor.plan(entry.after, { ...parsed, __tool: op.tool }, planNow);
+      const result = descriptor.plan(entry.after, { ...parsed, __tool: op.tool }, planNow, entry.meta);
       entry.after = result.state;
       if (descriptor.scope)
         entry.scope = unionScope(entry.scope, descriptor.scope({ ...parsed, __tool: op.tool }));
@@ -821,6 +854,19 @@ export async function applyPlan(
       try {
         if (descriptor.rollback && descriptor.guardedRollback?.(entry.meta)) {
           await descriptor.rollback(client, entry.ref, entry.before, entry.meta, deps.originId);
+        } else if (completedResources.includes(key)) {
+          // No guarded RPC for this resource: only restore if nobody changed it
+          // since we wrote it, otherwise a blind rollback would clobber the
+          // concurrent change.
+          const current = await readResource(client, entry.ref);
+          if (JSON.stringify(canonical(current)) !== JSON.stringify(canonical(entry.after))) {
+            outcomes.push({
+              ok: false,
+              detail: `fail ${key}: changed concurrently; restore skipped to avoid overwriting`,
+            });
+            continue;
+          }
+          await deps.restoreEntry(snapshotEntry);
         } else {
           await deps.restoreEntry(snapshotEntry);
         }

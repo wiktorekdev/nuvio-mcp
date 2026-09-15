@@ -179,6 +179,15 @@ Apply many canonical operations as one transaction:
   never makes a write retryable by itself.
 - A `401` triggers one transparent token refresh, then one retry.
 
+### Concurrency
+
+Optimistic concurrency is enforced where the backend supports it: **profile settings** (and the
+settings written by `nuvio_copy_setup`) use the guarded write with `expected_updated_at`. Other
+resources (home catalog, addons, plugins, collections, library, watch progress/history) are
+last-write-wins because there is no guarded RPC. On failure, `nuvio_apply_plan` will **not** roll
+back a resource that changed after the plan wrote it — it reports a partial result instead of
+clobbering the newer change.
+
 ### Backup scope
 
 `nuvio_export_backup` with no scope returns a full backup. When you pass `scope`, `profile_ids` or

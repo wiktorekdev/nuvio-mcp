@@ -493,6 +493,101 @@ test('empty content_id / content_type are rejected by direct and plan', async ()
 });
 
 // ---------------------------------------------------------------------------
+// M1: addon update/remove by id is equivalent in direct and plan
+// ---------------------------------------------------------------------------
+
+test('equivalence: addon update/remove by table id', async () => {
+  mock.store.addons[1] = [
+    {
+      id: '11111111-1111-4111-8111-111111111111',
+      url: 'https://a.example/m.json',
+      name: 'A',
+      enabled: true,
+      sort_order: 0,
+    },
+  ];
+  mock.store.addons[2] = [
+    {
+      id: '22222222-2222-4222-8222-222222222222',
+      url: 'https://a.example/m.json',
+      name: 'A',
+      enabled: true,
+      sort_order: 0,
+    },
+  ];
+  await mcp.call('nuvio_update_addon', {
+    profile_id: 1,
+    id: '11111111-1111-4111-8111-111111111111',
+    name: 'A2',
+    enabled: false,
+  });
+  const planned = await mcp.call(
+    'nuvio_apply_plan',
+    plan([
+      {
+        tool: 'nuvio_update_addon',
+        args: { profile_id: 2, id: '22222222-2222-4222-8222-222222222222', name: 'A2', enabled: false },
+      },
+    ])
+  );
+  assert.match(planned, /Plan applied/);
+  assert.deepEqual(
+    mock.store.addons[1].map((a) => [a.url, a.name, a.enabled]),
+    mock.store.addons[2].map((a) => [a.url, a.name, a.enabled])
+  );
+
+  await mcp.call('nuvio_remove_addon', {
+    profile_id: 1,
+    id: '11111111-1111-4111-8111-111111111111',
+    confirm: true,
+  });
+  const plannedRemove = await mcp.call(
+    'nuvio_apply_plan',
+    plan([
+      { tool: 'nuvio_remove_addon', args: { profile_id: 2, id: '22222222-2222-4222-8222-222222222222' } },
+    ])
+  );
+  assert.match(plannedRemove, /Plan applied/);
+  assert.equal(mock.store.addons[1].length, 0);
+  assert.equal(mock.store.addons[2].length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// M2/M3: rollback must not clobber a concurrent change to a completed resource
+// ---------------------------------------------------------------------------
+
+test('rollback skips a resource changed concurrently after the plan wrote it', async () => {
+  mock.store.addons[1] = [];
+  mock.store.home['1:tv'] = { settings_json: { row: 0 }, updated_at: new Date().toISOString() };
+  reset();
+  // While the home write is attempted, an external client changes addons.
+  mock.once('sync_push_home_catalog_settings', () => {
+    mock.store.addons[1].push({
+      url: 'https://foreign.example/m.json',
+      name: 'Foreign',
+      enabled: true,
+      sort_order: 99,
+    });
+  });
+  mock.failRpc('sync_push_home_catalog_settings', 1);
+  const out = await mcp.call(
+    'nuvio_apply_plan',
+    plan([
+      { tool: 'nuvio_add_addon', args: { profile_id: 1, url: 'https://plan.example/m.json', name: 'Plan' } },
+      {
+        tool: 'nuvio_update_home_catalog_settings',
+        args: { profile_id: 1, platform: 'tv', patch: { row: 5 } },
+      },
+    ])
+  );
+  assert.match(out, /partially applied/);
+  assert.ok(
+    mock.store.addons[1].some((a) => a.url === 'https://foreign.example/m.json'),
+    'concurrent addon change preserved'
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 6. pagination completeness + safety limit
 // ---------------------------------------------------------------------------
 
