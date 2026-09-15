@@ -46,10 +46,21 @@ export function registerAccountTools(server: McpServer, client: NuvioClient, cfg
     name: 'nuvio_export_backup',
     title: 'Export account backup',
     description:
-      'Export account data as a JSON backup (profiles, addons, plugins, library, progress, history, settings, collections). Credentials and tokens are excluded server-side.',
+      'Export account data as a JSON backup (profiles, addons, plugins, library, progress, history, settings, ' +
+      'collections). Credentials and tokens are excluded server-side. With no scope this is a full backup; pass ' +
+      'scope/profile_ids/platforms to narrow it.',
     risk: 'read',
-    schema: {},
-    handler: () => account.exportBackup(client),
+    schema: {
+      scope: z.array(z.string()).optional().describe('Sections to include (e.g. settings, addons)'),
+      profile_ids: z.array(z.number().int().min(1).max(6)).optional().describe('Only these profiles'),
+      platforms: z.array(z.string()).optional().describe('Only these setting platforms'),
+    },
+    handler: (args) =>
+      account.exportBackup(client, {
+        scope: args.scope,
+        profile_ids: args.profile_ids,
+        platforms: args.platforms,
+      }),
   });
 
   defineMutation(server, client, cfg, {

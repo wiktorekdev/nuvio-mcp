@@ -113,14 +113,43 @@ export async function addPlugin(
 export async function removePlugin(
   client: NuvioClient,
   profileId: number,
-  url: string,
+  match: { url?: string; id?: string },
   originId: string,
   apply: boolean
 ): Promise<ApplyResult<PluginPush[]>> {
-  const before = toPushShape(await listPlugins(client, profileId));
-  if (!before.some((p) => p.url === url)) throw new NuvioError(`Plugin not found: ${url}`);
-  const after = before.filter((p) => p.url !== url);
+  const rows = await listPlugins(client, profileId);
+  const target = rows.find((p) => (match.url ? p.url === match.url : p.id === match.id));
+  if (!target) throw new NuvioError('Plugin not found on profile');
+  const before = toPushShape(rows);
+  const after = before.filter((p) => p.url !== target.url);
   if (after.length !== before.length - 1) throw new NuvioError('Internal invariant failed (plugin remove)');
+  return commit(client, profileId, originId, before, after, apply);
+}
+
+/** Change a plugin's name, enabled flag, repo type or sort order. Identify it by url or table id. */
+export async function updatePlugin(
+  client: NuvioClient,
+  profileId: number,
+  match: { url?: string; id?: string },
+  changes: Partial<Omit<PluginInput, 'url'>>,
+  originId: string,
+  apply: boolean
+): Promise<ApplyResult<PluginPush[]>> {
+  const rows = await listPlugins(client, profileId);
+  const target = rows.find((p) => (match.url ? p.url === match.url : p.id === match.id));
+  if (!target) throw new NuvioError(`Plugin not found on profile ${profileId}`);
+  const before = toPushShape(rows);
+  const after = before.map((p) =>
+    p.url === target.url
+      ? {
+          url: p.url,
+          name: changes.name !== undefined ? changes.name : p.name,
+          enabled: changes.enabled !== undefined ? changes.enabled : p.enabled,
+          sort_order: changes.sort_order !== undefined ? changes.sort_order : p.sort_order,
+          repo_type: changes.repo_type !== undefined ? changes.repo_type : p.repo_type,
+        }
+      : p
+  );
   return commit(client, profileId, originId, before, after, apply);
 }
 

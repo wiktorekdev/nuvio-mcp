@@ -1,10 +1,26 @@
 import { NuvioError } from '../errors.js';
 import type { NuvioClient } from '../client.js';
 import type { ApplyResult } from '../types.js';
+import {
+  type HistoryKeyLike,
+  type LibraryKeyLike,
+  type ProgressKeyLike,
+  historyKeyOf,
+  libraryKeyOf,
+  progressKeyOf,
+  storedProgressKey,
+} from '../keys.js';
+import { readAllLibrary, readAllWatchHistory, readAllWatchProgress } from './readers.js';
+import {
+  planHistoryAdd,
+  planHistoryDelete,
+  planLibraryAdd,
+  planLibraryRemove,
+  planProgressDelete,
+  planProgressSet,
+} from './transitions.js';
 
-export interface LibraryItem {
-  content_id: string;
-  content_type: string;
+export interface LibraryItem extends LibraryKeyLike {
   name?: string | null;
   poster?: string | null;
   poster_shape?: string | null;
@@ -17,25 +33,33 @@ export interface LibraryItem {
   added_at?: number | null;
 }
 
-export interface WatchProgressEntry {
-  content_id: string;
+export interface WatchProgressEntry extends ProgressKeyLike {
   content_type: string;
   video_id?: string | null;
-  season?: number | null;
-  episode?: number | null;
   position: number;
   duration: number;
   last_watched?: number | null;
 }
 
-export interface WatchedItem {
-  content_id: string;
+export interface WatchHistoryItem extends HistoryKeyLike {
   content_type: string;
   title?: string | null;
-  season?: number | null;
-  episode?: number | null;
   watched_at?: number | null;
 }
+
+export type ProgressKey = ProgressKeyLike;
+export type HistoryKey = HistoryKeyLike;
+
+export { progressKeyOf, historyKeyOf };
+export const historyKeyFrom = historyKeyOf;
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Reads (public list tools keep their own pagination shape)
+// ---------------------------------------------------------------------------
 
 export async function getLibrary(
   client: NuvioClient,
@@ -43,7 +67,7 @@ export async function getLibrary(
   limit = 100,
   offset = 0
 ): Promise<unknown[]> {
-  return client.rpc('sync_pull_library', { p_profile_id: profileId, p_limit: limit, p_offset: offset });
+  return client.readRpc('sync_pull_library', { p_profile_id: profileId, p_limit: limit, p_offset: offset });
 }
 
 export async function getWatchProgress(
@@ -51,7 +75,7 @@ export async function getWatchProgress(
   profileId: number,
   limit = 100
 ): Promise<unknown[]> {
-  return client.rpc('sync_pull_watch_progress', { p_profile_id: profileId, p_limit: limit });
+  return client.readRpc('sync_pull_watch_progress', { p_profile_id: profileId, p_limit: limit });
 }
 
 export async function getWatchHistory(
@@ -60,45 +84,41 @@ export async function getWatchHistory(
   page = 1,
   pageSize = 100
 ): Promise<unknown[]> {
-  return client.rpc('sync_pull_watched_items', {
+  return client.readRpc('sync_pull_watched_items', {
     p_profile_id: profileId,
     p_page: page,
     p_page_size: pageSize,
   });
 }
 
+// ---------------------------------------------------------------------------
+// Mutations (complete readers; deletes are not gated on a first page)
+// ---------------------------------------------------------------------------
+
 export async function addToLibrary(
   client: NuvioClient,
   profileId: number,
-  item: LibraryItem,
+  items: LibraryItem[],
   originId: string,
-  apply: boolean
+  apply: boolean,
+  now = nowSeconds()
 ): Promise<ApplyResult<unknown[]>> {
-  if (!item.content_id || !item.content_type) {
-    throw new NuvioError('content_id and content_type are required');
-  }
-  const before = await getLibrary(client, profileId, 1000, 0);
-  const exists = (before as Array<Record<string, unknown>>).some(
-    (i) => i.content_id === item.content_id && i.content_type === item.content_type
-  );
-  if (apply) {
+  if (items.length === 0) throw new NuvioError('At least one item is required');
+  const before = (await readAllLibrary(client, profileId)) as Array<Record<string, unknown>>;
+  const { after, diff } = planLibraryAdd(before, items, now);
+  if (apply && diff.length > 0) {
+    const pushes = after.filter((row) => {
+      const key = libraryKeyOf(row as unknown as LibraryItem);
+      const prev = before.find((b) => libraryKeyOf(b as unknown as LibraryItem) === key);
+      return !prev || JSON.stringify(prev) !== JSON.stringify(row);
+    });
     await client.rpc('sync_push_library_items', {
       p_profile_id: profileId,
-      p_items: [{ ...item, added_at: item.added_at ?? Math.floor(Date.now() / 1000) }],
+      p_items: pushes,
       p_origin_client_id: originId,
     });
   }
-  return {
-    applied: apply,
-    changed: true,
-    before,
-    after: before,
-    diff: [
-      exists
-        ? `~ update library item ${item.content_type}:${item.content_id}`
-        : `+ library ${item.content_type}:${item.content_id}`,
-    ],
-  };
+  return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
 }
 
 export async function removeFromLibrary(
@@ -109,7 +129,10 @@ export async function removeFromLibrary(
   apply: boolean
 ): Promise<ApplyResult<unknown[]>> {
   if (keys.length === 0) throw new NuvioError('At least one key is required');
-  const before = await getLibrary(client, profileId, 1000, 0);
+  const before = (await readAllLibrary(client, profileId)) as Array<Record<string, unknown>>;
+  const { after, diff } = planLibraryRemove(before, keys);
+  // Always send the delete for the provided keys — the backend is the source of
+  // truth, not the read page.
   if (apply) {
     await client.rpc('sync_delete_library_items', {
       p_profile_id: profileId,
@@ -117,117 +140,111 @@ export async function removeFromLibrary(
       p_origin_client_id: originId,
     });
   }
-  return {
-    applied: apply,
-    changed: true,
-    before,
-    after: before,
-    diff: keys.map((k) => `- library ${k.content_type}:${k.content_id}`),
-  };
+  return { applied: apply, changed: keys.length > 0, before, after, diff };
 }
 
 export async function setWatchProgress(
   client: NuvioClient,
   profileId: number,
-  entry: WatchProgressEntry,
+  entries: WatchProgressEntry[],
   originId: string,
-  apply: boolean
+  apply: boolean,
+  now = nowSeconds()
 ): Promise<ApplyResult<unknown[]>> {
-  if (!entry.content_id || !entry.content_type) {
-    throw new NuvioError('content_id and content_type are required');
-  }
-  const before = await getWatchProgress(client, profileId, 1000);
-  if (apply) {
+  if (entries.length === 0) throw new NuvioError('At least one entry is required');
+  const before = (await readAllWatchProgress(client, profileId, { requireComplete: true })) as Array<
+    Record<string, unknown>
+  >;
+  const { after, diff } = planProgressSet(before, entries, now);
+  if (apply && diff.length > 0) {
+    const pushes = after.filter((row) => {
+      const prev = before.find((b) => storedProgressKey(b) === storedProgressKey(row));
+      return !prev || JSON.stringify(prev) !== JSON.stringify(row);
+    });
     await client.rpc('sync_push_watch_progress', {
       p_profile_id: profileId,
-      p_entries: [{ ...entry, last_watched: entry.last_watched ?? Math.floor(Date.now() / 1000) }],
+      p_entries: pushes,
       p_origin_client_id: originId,
     });
   }
-  const scope = entry.season != null ? ` S${entry.season}E${entry.episode}` : '';
-  return {
-    applied: apply,
-    changed: true,
-    before,
-    after: before,
-    diff: [
-      `~ progress ${entry.content_type}:${entry.content_id}${scope} @ ${entry.position}/${entry.duration}`,
-    ],
-  };
+  return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
 }
 
-export async function markWatched(
+export async function addToWatchHistory(
   client: NuvioClient,
   profileId: number,
-  item: WatchedItem,
+  items: WatchHistoryItem[],
   originId: string,
-  apply: boolean
+  apply: boolean,
+  now = nowSeconds()
 ): Promise<ApplyResult<unknown[]>> {
-  if (!item.content_id || !item.content_type) {
-    throw new NuvioError('content_id and content_type are required');
-  }
-  const before = await getWatchHistory(client, profileId, 1, 1000);
-  if (apply) {
+  if (items.length === 0) throw new NuvioError('At least one item is required');
+  const before = (await readAllWatchHistory(client, profileId)) as Array<Record<string, unknown>>;
+  const { after, diff } = planHistoryAdd(before, items, now);
+  if (apply && diff.length > 0) {
+    const pushes = after.filter((row) => {
+      const prev = before.find(
+        (b) => historyKeyOf(b as unknown as HistoryKey) === historyKeyOf(row as unknown as HistoryKey)
+      );
+      return !prev || JSON.stringify(prev) !== JSON.stringify(row);
+    });
     await client.rpc('sync_push_watched_items', {
       p_profile_id: profileId,
-      p_items: [{ ...item, watched_at: item.watched_at ?? Math.floor(Date.now() / 1000) }],
+      p_items: pushes,
       p_origin_client_id: originId,
     });
   }
-  const scope = item.season != null ? ` S${item.season}E${item.episode}` : '';
-  return {
-    applied: apply,
-    changed: true,
-    before,
-    after: before,
-    diff: [`~ watched ${item.content_type}:${item.content_id}${scope}`],
-  };
+  return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
 }
 
 export async function deleteWatchProgress(
   client: NuvioClient,
   profileId: number,
-  keys: unknown[],
+  keys: ProgressKey[],
   originId: string,
   apply: boolean
 ): Promise<ApplyResult<unknown[]>> {
-  const before = await getWatchProgress(client, profileId, 1000);
+  if (keys.length === 0) throw new NuvioError('At least one key is required');
+  const before = (await readAllWatchProgress(client, profileId, { requireComplete: true })) as Array<
+    Record<string, unknown>
+  >;
+  const { after, diff } = planProgressDelete(before, keys);
+  const wanted = new Set(keys.map((k) => progressKeyOf(k)));
+  const internalKeys = new Set<string>();
+  for (const key of keys) internalKeys.add(progressKeyOf(key));
+  for (const row of before) {
+    if (wanted.has(progressKeyOf(row as unknown as ProgressKey))) internalKeys.add(storedProgressKey(row));
+  }
   if (apply) {
     await client.rpc('sync_delete_watch_progress', {
       p_profile_id: profileId,
-      p_keys: keys,
+      p_keys: [...internalKeys],
       p_origin_client_id: originId,
     });
   }
-  return {
-    applied: apply,
-    changed: keys.length > 0,
-    before,
-    after: before,
-    diff: keys.map((k) => `- watch progress ${JSON.stringify(k)}`),
-  };
+  return { applied: apply, changed: keys.length > 0, before, after, diff };
 }
 
 export async function deleteWatchHistory(
   client: NuvioClient,
   profileId: number,
-  keys: unknown[],
+  keys: HistoryKey[],
   originId: string,
   apply: boolean
 ): Promise<ApplyResult<unknown[]>> {
-  const before = await getWatchHistory(client, profileId, 1, 1000);
+  if (keys.length === 0) throw new NuvioError('At least one key is required');
+  const before = (await readAllWatchHistory(client, profileId)) as Array<Record<string, unknown>>;
+  const { after, diff } = planHistoryDelete(before, keys);
   if (apply) {
     await client.rpc('sync_delete_watched_items', {
       p_profile_id: profileId,
-      p_keys: keys,
+      p_keys: keys.map((k) => ({
+        content_id: k.content_id,
+        season: k.season ?? null,
+        episode: k.episode ?? null,
+      })),
       p_origin_client_id: originId,
     });
   }
-  return {
-    applied: apply,
-    changed: keys.length > 0,
-    before,
-    after: before,
-    diff: keys.map((k) => `- watch history ${JSON.stringify(k)}`),
-  };
+  return { applied: apply, changed: keys.length > 0, before, after, diff };
 }

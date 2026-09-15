@@ -37,13 +37,13 @@
 - Export backups
 - Undo and redo reversible changes
 - Two-step confirmation for irreversible operations
-- stdio and remote Streamable HTTP
+- stdio and remote HTTP transports
 
 `nuvio_capabilities` lists every tool at runtime.
 
 ## Installation
 
-Add it to your MCP clients with [add-mcp](https://add-mcp.com):
+Add it to your MCP client with [add-mcp](https://add-mcp.com):
 
 ```bash
 npx add-mcp nuvio-mcp -g \
@@ -51,7 +51,7 @@ npx add-mcp nuvio-mcp -g \
   --env "NUVIO_PASSWORD=your-password"
 ```
 
-Run the server directly over stdio:
+Or run the server directly over stdio:
 
 ```bash
 npx -y nuvio-mcp
@@ -70,15 +70,18 @@ node dist/index.js
 
 ## Configuration
 
-| Variable              | Description                        |
-| --------------------- | ---------------------------------- |
-| `NUVIO_EMAIL`         | Nuvio account email                |
-| `NUVIO_PASSWORD`      | Nuvio account password             |
-| `NUVIO_REFRESH_TOKEN` | Alternative to email/password      |
-| `NUVIO_TRANSPORT`     | `stdio` (default) or `http`        |
-| `NUVIO_HTTP_TOKEN`    | Bearer token for the HTTP endpoint |
+Set these in your MCP client's env or in `.env`:
 
-See [`.env.example`](.env.example) for all options.
+| Variable                   | Description                    |
+| -------------------------- | ------------------------------ |
+| `NUVIO_EMAIL`              | Nuvio account email            |
+| `NUVIO_PASSWORD`           | Nuvio account password         |
+| `NUVIO_REFRESH_TOKEN`      | Alternative to email/password  |
+| `NUVIO_BACKEND_TIMEOUT_MS` | Backend request timeout (ms)   |
+| `NUVIO_TRANSPORT`          | `stdio` (default) or `http`    |
+| `NUVIO_HTTP_TOKEN`         | Bearer token for the HTTP mode |
+
+See [`.env.example`](.env.example) for the rest (HTTP limits, snapshot retention, OAuth).
 
 ## Remote MCP
 
@@ -90,9 +93,8 @@ NUVIO_HTTP_TOKEN="$(openssl rand -hex 32)" \
 npx -y nuvio-mcp
 ```
 
-- Streamable HTTP endpoint: `POST /mcp`
+- MCP endpoint: `POST /mcp`
 - Health: `GET /health`
-- Bearer token, or OAuth introspection when configured
 - A non-loopback bind requires authentication
 
 Docker:
@@ -109,16 +111,16 @@ docker run --rm -p 3333:3333 \
 
 ## Safety
 
-- Reversible mutations create a snapshot before they run
-- Undo and redo via `nuvio_undo` and `nuvio_redo`
-- Irreversible operations use two-step confirmation
-- Secrets are masked from MCP outputs
-- Sensitive snapshots may contain raw credentials locally, for exact undo
+- Reversible changes are snapshotted first and can be reverted with `nuvio_undo` / `nuvio_redo`.
+- Irreversible operations use two-step confirmation.
+- Known secret fields are masked in tool output.
+- Set `NUVIO_DISABLE_SNAPSHOTS=true` to write no snapshots at all (no undo and no secrets stored in
+  snapshots).
 
-Set `NUVIO_DISABLE_SNAPSHOTS=true` to never write snapshots locally: reversible changes then run
-without snapshots and cannot be undone, and no raw credentials are stored on disk.
+Snapshots are cleaned up automatically (age, count and total size). Old snapshots can also be
+removed on demand with `nuvio_prune_snapshots`. See [`.env.example`](.env.example) for the limits.
 
-See [SECURITY.md](SECURITY.md) for the security model.
+See [SECURITY.md](SECURITY.md) for the full security model.
 
 ## Development
 

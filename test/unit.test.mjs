@@ -171,6 +171,52 @@ test('fetchJsonFromPublicUrl refuses loopback, private and non-http targets', as
   await assert.rejects(() => fetchJsonFromPublicUrl('file:///etc/passwd'), /http\(s\)/);
 });
 
+test('NuvioClient retries a 429 and then succeeds', async () => {
+  const { NuvioClient } = await import('../dist/nuvio/client.js');
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response('rate limited', { status: 429, headers: { 'retry-after': '0' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  try {
+    const client = new NuvioClient(
+      { backendUrl: 'https://api.example', publishableKey: 'k', backendTimeoutMs: 1000 },
+      { getAccessToken: async () => 'token', forceRefresh: async () => {} }
+    );
+    assert.deepEqual(await client.request('/rest/v1/rpc/x'), { ok: true });
+    assert.equal(calls, 2, 'should retry the rate-limited request once');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('NuvioClient surfaces a persistent 429 after bounded retries', async () => {
+  const { NuvioClient } = await import('../dist/nuvio/client.js');
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response('rate limited', { status: 429, headers: { 'retry-after': '0' } });
+  };
+  try {
+    const client = new NuvioClient(
+      { backendUrl: 'https://api.example', publishableKey: 'k', backendTimeoutMs: 1000 },
+      { getAccessToken: async () => 'token', forceRefresh: async () => {} }
+    );
+    await assert.rejects(() => client.request('/rest/v1/rpc/x'), /429/);
+    assert.ok(calls > 1, 'should have retried before giving up');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test('fetchJsonFromPublicUrl re-validates every redirect hop', async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async () =>

@@ -5,15 +5,19 @@ import { z } from 'zod';
 import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
 import type { ApplyResult } from '../nuvio/types.js';
+import { withCallCache } from '../nuvio/call-context.js';
 import { NuvioError } from '../nuvio/errors.js';
 import {
   capture,
+  captureComposite,
   readResource,
   removeSnapshot,
+  restoreResource,
   SnapshotError,
   type ResourceRef,
   type Snapshot,
 } from '../nuvio/snapshots.js';
+import { applyPlan, type PlanOperation, type PlanResult } from '../nuvio/ops/plan.js';
 import { ConfirmationGate } from '../nuvio/confirm.js';
 import { maskDeep } from '../mask.js';
 
@@ -22,7 +26,14 @@ export type Risk = 'read' | 'write' | 'destructive';
 export interface ExecCtx {
   client: NuvioClient;
   config: NuvioConfig;
+  /** True when the write should be performed (i.e. not a dry run and confirmed). */
   apply: boolean;
+  /** True when the caller asked only for the diff. */
+  dryRun: boolean;
+  /** Cached pre-change state of the mutation's resource, if it has one. */
+  before: unknown;
+  /** Read any resource with per-call caching (at most one backend request per resource). */
+  read: (ref: ResourceRef) => Promise<unknown>;
 }
 
 interface CommonSpec<S extends z.ZodRawShape> {
@@ -32,6 +43,10 @@ interface CommonSpec<S extends z.ZodRawShape> {
   risk: Risk;
   schema: S;
   annotations?: ToolAnnotations;
+  /** False for legacy aliases; they stay callable but are hidden from capabilities. */
+  canonical?: boolean;
+  /** Replacement tool name for deprecated aliases. */
+  replacement?: string;
 }
 
 export interface ReadSpec<S extends z.ZodRawShape> extends CommonSpec<S> {
@@ -49,11 +64,21 @@ export interface MutationSpec<S extends z.ZodRawShape> extends CommonSpec<S> {
   handler: (args: z.infer<z.ZodObject<S>>, ctx: ExecCtx) => Promise<ApplyResult<unknown>>;
 }
 
+/** A destructive operation that only affects local MCP state (no backend resource). */
+export interface LocalMutationSpec<S extends z.ZodRawShape> extends CommonSpec<S> {
+  handler: (
+    args: z.infer<z.ZodObject<S>>,
+    ctx: ExecCtx
+  ) => Promise<{ changed: boolean; applied: boolean; diff: string[] }>;
+}
+
 export interface RegisteredToolInfo {
   name: string;
   title: string;
   risk: Risk;
   description: string;
+  canonical: boolean;
+  replacement?: string;
 }
 
 export const registry: RegisteredToolInfo[] = [];
@@ -117,30 +142,94 @@ function formatApplied(
   return `✅ Applied ${title}.\n\nChanges:\n${diffLines(result.diff)}${undo}`;
 }
 
+interface RegisterInfo {
+  name: string;
+  title: string;
+  description: string;
+  risk: Risk;
+  canonical?: boolean;
+  replacement?: string;
+}
+
+function registerInfo(spec: RegisterInfo): RegisteredToolInfo {
+  const canonical = spec.canonical ?? true;
+  const info: RegisteredToolInfo = {
+    name: spec.name,
+    title: spec.title,
+    risk: spec.risk,
+    description: spec.description,
+    canonical,
+    replacement: spec.replacement,
+  };
+  registry.push(info);
+  return info;
+}
+
+function described(spec: CommonSpec<z.ZodRawShape>, base: string): string {
+  if (spec.canonical !== false) return base;
+  const replacement = spec.replacement ? ` Use ${spec.replacement} instead.` : '';
+  return `[DEPRECATED]${replacement} ${base}`;
+}
+
 export function defineRead<S extends z.ZodRawShape>(
   server: McpServer,
   client: NuvioClient,
   cfg: NuvioConfig,
   spec: ReadSpec<S>
 ): void {
-  registry.push({ name: spec.name, title: spec.title, risk: spec.risk, description: spec.description });
+  registerInfo(spec);
   server.registerTool(
     spec.name,
     {
       title: spec.title,
-      description: spec.description,
+      description: described(spec, spec.description),
       inputSchema: z.object(spec.schema),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true, ...spec.annotations },
     },
     (async (args: z.infer<z.ZodObject<S>>) => {
-      try {
-        const data = await spec.handler(args, { client, config: cfg, apply: true });
-        return textResult(typeof data === 'string' ? data : jsonBlock(data));
-      } catch (error) {
-        return textResult(formatError(error), true);
-      }
+      return withCallCache(async () => {
+        try {
+          const ctx: ExecCtx = {
+            client,
+            config: cfg,
+            apply: true,
+            dryRun: false,
+            before: undefined,
+            read: (ref) => readResource(client, ref),
+          };
+          const data = await spec.handler(args, ctx);
+          return textResult(typeof data === 'string' ? data : jsonBlock(data));
+        } catch (error) {
+          return textResult(formatError(error), true);
+        }
+      });
     }) as never
   );
+}
+
+function dryRunField(destructive: boolean, reversible: boolean): z.ZodRawShape {
+  const shape: Record<string, z.ZodType> = {
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe('Return the diff without writing anything (no snapshot, no audit entry).'),
+  };
+  if (destructive && reversible) {
+    shape.confirm = z
+      .boolean()
+      .optional()
+      .describe('Required to actually apply a destructive change. Without it a preview is returned.');
+  }
+  if (!reversible) {
+    shape.confirmation_token = z
+      .string()
+      .optional()
+      .describe(
+        'Token from a previous call of this tool. Irreversible operations require a two-phase ' +
+          'prepare/execute: call once to receive the token, then call again with it.'
+      );
+  }
+  return shape as z.ZodRawShape;
 }
 
 export function defineMutation<S extends z.ZodRawShape>(
@@ -149,41 +238,21 @@ export function defineMutation<S extends z.ZodRawShape>(
   cfg: NuvioConfig,
   spec: MutationSpec<S>
 ): void {
-  registry.push({ name: spec.name, title: spec.title, risk: spec.risk, description: spec.description });
+  registerInfo(spec);
   const destructive = spec.risk === 'destructive';
   const reversible = spec.reversible ?? true;
-
-  const baseShape = destructive
-    ? {
-        ...spec.schema,
-        confirm: z
-          .boolean()
-          .optional()
-          .describe('Required for reversible destructive changes. Without it a preview is returned.'),
-      }
-    : spec.schema;
-  const shape = (
-    reversible
-      ? baseShape
-      : {
-          ...baseShape,
-          confirmation_token: z
-            .string()
-            .optional()
-            .describe(
-              'Token from a previous call of this tool. Irreversible operations require a two-phase ' +
-                'prepare/execute: call once to receive the token, then call again with it.'
-            ),
-        }
-  ) as z.ZodRawShape;
+  const shape = { ...spec.schema, ...dryRunField(destructive, reversible) } as z.ZodRawShape;
 
   server.registerTool(
     spec.name,
     {
       title: spec.title,
-      description: reversible
-        ? `${spec.description} The previous state is snapshotted before the write; revert with nuvio_undo.`
-        : `${spec.description} This operation cannot be undone: it uses two-phase confirmation — call it once to get a short-lived confirmation token, then call again with that token to execute.`,
+      description: described(
+        spec,
+        reversible
+          ? `${spec.description} Supports dry_run and snapshots the previous state before the write; revert with nuvio_undo.`
+          : `${spec.description} Cannot be undone: call it once to get a short-lived confirmation token, then call again with that token. Supports dry_run.`
+      ),
       inputSchema: z.object(shape),
       annotations: {
         readOnlyHint: false,
@@ -194,60 +263,271 @@ export function defineMutation<S extends z.ZodRawShape>(
       },
     },
     (async (args: Record<string, unknown>) => {
-      try {
-        const typed = args as z.infer<z.ZodObject<S>>;
-        const resource = typeof spec.resource === 'function' ? spec.resource(typed) : spec.resource;
+      return withCallCache(async () => {
+        try {
+          const typed = args as z.infer<z.ZodObject<S>>;
+          const resource = typeof spec.resource === 'function' ? spec.resource(typed) : spec.resource;
+          const dryRun = args.dry_run === true;
 
-        // Irreversible operations: two-phase token instead of the confirm flag.
-        if (!reversible) {
-          if (typeof args.confirmation_token !== 'string' || args.confirmation_token.length === 0) {
-            const preview = await spec.handler(typed, { client, config: cfg, apply: false });
-            const { token, expires_at } = confirmationGate.prepare(spec.name, args);
+          // Irreversible operations: two-phase token instead of the confirm flag.
+          if (!reversible) {
+            if (
+              !dryRun &&
+              (typeof args.confirmation_token !== 'string' || args.confirmation_token.length === 0)
+            ) {
+              const preview = await spec.handler(typed, {
+                client,
+                config: cfg,
+                apply: false,
+                dryRun: false,
+                before: undefined,
+                read: (ref) => readResource(client, ref),
+              });
+              const { token, expires_at } = confirmationGate.prepare(spec.name, args);
+              return textResult(
+                formatPreview(
+                  spec.title,
+                  preview,
+                  `\n\n⚠️ ${spec.title} cannot be undone. To execute, call the same tool again with the same ` +
+                    `arguments plus:\n  confirmation_token: "${token}"\nToken expires at ${expires_at}.`
+                )
+              );
+            }
+            if (!dryRun) confirmationGate.verify(spec.name, args, args.confirmation_token);
+          }
+
+          const apply = !dryRun && (reversible ? (destructive ? args.confirm === true : true) : true);
+          const snapshotsDisabled = cfg.disableSnapshots;
+
+          let snapshot: Snapshot | undefined;
+          let before: unknown;
+          if (apply && reversible && !snapshotsDisabled) {
+            before = await readResource(client, resource);
+            snapshot = capture(cfg, client, {
+              tool: spec.name,
+              resource,
+              before,
+              reversible: true,
+              note: spec.note,
+              scope: spec.scope?.(typed),
+            });
+          }
+
+          const ctx: ExecCtx = {
+            client,
+            config: cfg,
+            apply,
+            dryRun,
+            before,
+            read: (ref) => readResource(client, ref),
+          };
+          let result: ApplyResult<unknown>;
+          try {
+            result = await spec.handler(typed, ctx);
+          } catch (error) {
+            // The write failed: drop the pre-change snapshot so a failed mutation
+            // never leaves a stale, non-revertible snapshot behind.
+            if (snapshot) removeSnapshot(cfg, snapshot.id);
+            throw error;
+          }
+
+          if (snapshot && !(result.applied && result.changed)) removeSnapshot(cfg, snapshot.id);
+
+          if (result.applied && result.changed) {
+            audit(cfg, { tool: spec.name, resource, args, diff: result.diff, snapshot: snapshot?.id });
+          }
+          if (!result.applied) {
             return textResult(
-              formatPreview(
-                spec.title,
-                preview,
-                `\n\n⚠️ ${spec.title} cannot be undone. To execute, call the same tool again with the same ` +
-                  `arguments plus:\n  confirmation_token: "${token}"\nToken expires at ${expires_at}.`
-              )
+              result.changed ? formatPreview(spec.title, result) : `No changes required for ${spec.title}.`
             );
           }
-          confirmationGate.verify(spec.name, args, args.confirmation_token);
+          return textResult(formatApplied(spec.title, result, snapshot?.id, snapshotsDisabled));
+        } catch (error) {
+          return textResult(formatError(error), true);
         }
+      });
+    }) as never
+  );
+}
 
-        // Determine whether the write happens, then take the mandatory snapshot first.
-        const apply = reversible ? (destructive ? args.confirm === true : true) : true;
-        const snapshotsDisabled = cfg.disableSnapshots;
+/**
+ * A destructive operation that touches only local MCP state (no backend
+ * resource, so no pre-change snapshot). Supports dry_run; a real run requires
+ * `confirm: true`.
+ */
+export function defineLocalMutation<S extends z.ZodRawShape>(
+  server: McpServer,
+  client: NuvioClient,
+  cfg: NuvioConfig,
+  spec: LocalMutationSpec<S>
+): void {
+  registerInfo(spec);
+  const shape = {
+    ...spec.schema,
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe(
+        'Force a preview. Without `confirm` the operation always previews, even if dry_run is false.'
+      ),
+    confirm: z.boolean().optional().describe('Required to actually delete. Without it nothing is removed.'),
+  } as z.ZodRawShape;
 
-        let snapshot: Snapshot | undefined;
-        if (reversible && apply && !snapshotsDisabled) {
-          const before = await readResource(client, resource);
-          snapshot = capture(cfg, client, {
-            tool: spec.name,
-            resource,
-            before,
-            reversible: true,
-            note: spec.note,
-            scope: spec.scope?.(typed),
-          });
-        }
-
-        const result = await spec.handler(typed, { client, config: cfg, apply });
-
-        if (snapshot && !(result.applied && result.changed)) removeSnapshot(cfg, snapshot.id);
-
+  server.registerTool(
+    spec.name,
+    {
+      title: spec.title,
+      description: `${spec.description} Destructive local operation: previews unless confirm=true; dry_run=true always previews.`,
+      inputSchema: z.object(shape),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    (async (args: Record<string, unknown>) => {
+      try {
+        const typed = args as z.infer<z.ZodObject<S>>;
+        // Apply only with an explicit confirm and no explicit dry_run.
+        const apply = args.confirm === true && args.dry_run !== true;
+        const dryRun = !apply;
+        const ctx: ExecCtx = {
+          client,
+          config: cfg,
+          apply,
+          dryRun,
+          before: undefined,
+          read: (ref) => readResource(client, ref),
+        };
+        const result = await spec.handler(typed, ctx);
         if (result.applied && result.changed) {
-          audit(cfg, { tool: spec.name, resource, args, diff: result.diff, snapshot: snapshot?.id });
+          audit(cfg, { tool: spec.name, args, diff: result.diff });
         }
+        if (!result.changed) return textResult(`No changes required for ${spec.title}.`);
         if (!result.applied) {
           return textResult(
-            result.changed ? formatPreview(spec.title, result) : `No changes required for ${spec.title}.`
+            `📝 Preview for ${spec.title} — nothing was removed.\n\nWould remove:\n${diffLines(result.diff)}` +
+              '\n\nPass confirm: true to delete.'
           );
         }
-        return textResult(formatApplied(spec.title, result, snapshot?.id, snapshotsDisabled));
+        return textResult(`✅ Applied ${spec.title}.\n\nChanges:\n${diffLines(result.diff)}`);
       } catch (error) {
         return textResult(formatError(error), true);
       }
+    }) as never
+  );
+}
+
+function formatPlanResult(result: PlanResult): string {
+  const lines: string[] = [];
+  const header: Record<PlanResult['status'], string> = {
+    preview: '📝 Plan preview — nothing was written.',
+    applied: '✅ Plan applied.',
+    rolled_back: '↩️ Plan failed and was rolled back.',
+    partially_applied: '⚠️ Plan partially applied; rollback did not fully succeed.',
+    failed_before_apply: '🛑 Plan rejected before any write.',
+  };
+  lines.push(header[result.status]);
+  if (result.failed_operation) {
+    lines.push(
+      `Failed operation #${result.failed_operation.index} (${result.failed_operation.tool}): ${result.failed_operation.error}`
+    );
+  }
+  if (result.rollback) {
+    lines.push(
+      `Rollback: attempted=${result.rollback.attempted} successful=${result.rollback.successful} — ${result.rollback.detail}`
+    );
+  }
+  if (result.snapshot_id) {
+    lines.push(
+      `Composite snapshot ${result.snapshot_id}.` +
+        `\n\n↩️ Undo available: call nuvio_undo with snapshot_id "${result.snapshot_id}" to revert the whole plan.`
+    );
+  }
+  lines.push(`Applied operations: ${result.applied_operations.length}/${result.operations.length}`);
+  for (const op of result.operations) {
+    lines.push(`  #${op.index} ${op.tool} [${op.resource}]`);
+    for (const d of op.diff) lines.push(`    ${d}`);
+  }
+  lines.push('Per-resource diff:');
+  for (const r of result.resources) {
+    lines.push(`  ${r.resource}:`);
+    for (const d of r.diff) lines.push(`    ${d}`);
+  }
+  return lines.join('\n');
+}
+
+/** nuvio_apply_plan: a transactional, multi-operation mutation backed by one composite snapshot. */
+export function definePlanMutation(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
+  registerInfo({
+    name: 'nuvio_apply_plan',
+    title: 'Apply a plan of operations',
+    description:
+      'Apply several canonical operations as one transaction: validated up front, one read per resource, one write ' +
+      'per resource, a single composite snapshot, and rollback on failure. Defaults to dry_run.',
+    risk: 'write',
+    canonical: true,
+  });
+  const inputSchema = z.object({
+    operations: z
+      .array(z.object({ tool: z.string().min(1), args: z.record(z.string(), z.unknown()).default({}) }))
+      .min(1),
+    dry_run: z.boolean().optional().default(true).describe('Default true: validate and preview only.'),
+  });
+
+  server.registerTool(
+    'nuvio_apply_plan',
+    {
+      title: 'Apply a plan of operations',
+      description:
+        'Apply several canonical operations as one transaction with a composite snapshot and rollback. Defaults to dry_run.',
+      inputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    (async (args: { operations: PlanOperation[]; dry_run?: boolean }) => {
+      return withCallCache(async () => {
+        try {
+          const result = await applyPlan(args.operations, args.dry_run !== false, {
+            client,
+            originId: cfg.originClientId,
+            snapshotsDisabled: cfg.disableSnapshots,
+            captureComposite: (entries) =>
+              cfg.disableSnapshots
+                ? undefined
+                : captureComposite(cfg, client, {
+                    tool: 'nuvio_apply_plan',
+                    entries,
+                    reversible: true,
+                    note: 'composite snapshot for a plan',
+                  }).id,
+            restoreEntry: async (entry) => {
+              await restoreResource(client, cfg, entry, {
+                id: 'nuvio_apply_plan',
+                tool: 'nuvio_apply_plan',
+                reversible: true,
+              } as Snapshot);
+            },
+          });
+          if (['applied', 'rolled_back', 'partially_applied'].includes(result.status)) {
+            audit(cfg, {
+              tool: 'nuvio_apply_plan',
+              status: result.status,
+              operations: args.operations,
+              attempted_resources: result.attempted_resources,
+              completed_resources: result.completed_resources,
+              applied_operations: result.applied_operations,
+              failed_operation: result.failed_operation,
+              rollback: result.rollback,
+              diff: result.resources.flatMap((r) => r.diff),
+              snapshot: result.snapshot_id,
+            });
+          }
+          return textResult(formatPlanResult(result));
+        } catch (error) {
+          return textResult(formatError(error), true);
+        }
+      });
     }) as never
   );
 }

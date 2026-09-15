@@ -29,6 +29,10 @@ export interface NuvioConfig {
   backendTimeoutMs: number;
   /** When true, no snapshots are written and reversible changes cannot be undone. */
   disableSnapshots: boolean;
+  /** Automatic snapshot retention limits (best-effort GC after every write). */
+  snapshotMaxAgeDays: number;
+  snapshotMaxCount: number;
+  snapshotMaxTotalBytes: number;
   transport: Transport;
   http: {
     host: string;
@@ -107,6 +111,9 @@ export function loadConfig(): NuvioConfig {
     snapshotDir: process.env.NUVIO_SNAPSHOT_DIR?.trim() || join(dataDir, 'snapshots'),
     backendTimeoutMs: int(process.env.NUVIO_BACKEND_TIMEOUT_MS, 30_000),
     disableSnapshots: bool(process.env.NUVIO_DISABLE_SNAPSHOTS, false),
+    snapshotMaxAgeDays: int(process.env.NUVIO_SNAPSHOT_MAX_AGE_DAYS, 30),
+    snapshotMaxCount: int(process.env.NUVIO_SNAPSHOT_MAX_COUNT, 250),
+    snapshotMaxTotalBytes: int(process.env.NUVIO_SNAPSHOT_MAX_TOTAL_BYTES, 50 * 1024 * 1024),
     transport,
     http: {
       host: process.env.NUVIO_HTTP_HOST?.trim() || '127.0.0.1',

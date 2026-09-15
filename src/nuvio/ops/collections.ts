@@ -3,7 +3,7 @@ import type { NuvioClient } from '../client.js';
 import type { ApplyResult, Collection, CollectionFolder, CollectionsBlob } from '../types.js';
 
 export async function getCollections(client: NuvioClient, profileId: number): Promise<Collection[]> {
-  const rows = await client.rpc<CollectionsBlob[]>('sync_pull_collections', { p_profile_id: profileId });
+  const rows = await client.readRpc<CollectionsBlob[]>('sync_pull_collections', { p_profile_id: profileId });
   return rows[0]?.collections_json ?? [];
 }
 

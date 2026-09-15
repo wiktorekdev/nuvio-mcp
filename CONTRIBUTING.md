@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for taking the time to contribute. This is an unofficial community project and is not
-affiliated with or endorsed by Nuvio.
+Thanks for helping. This is an unofficial community project, not affiliated with or endorsed by
+Nuvio.
 
 ## Requirements
 
@@ -30,19 +30,30 @@ npm test
 bash test/docker-smoke.sh   # optional, needs Docker
 ```
 
-`npm test` builds the server and exercises it over stdio and HTTP against an in-memory mock backend
+`npm test` builds the server and runs it over stdio and HTTP against an in-memory mock backend
 (`test/mock-nuvio.mjs`), so no real Nuvio account is needed.
+
+## Tools
+
+- Register mutations with `defineMutation` / `defineLocalMutation`; they handle dry runs, previews,
+  snapshots and audit. Never hardcode `apply: true` in a handler — use `ctx.apply`.
+- Read resources through `client.readRpc` / `client.select`.
+- Tool argument schemas live in `src/nuvio/schemas.ts`. `nuvio_apply_plan` validates operations with
+  the same schemas as the direct tools, so keep them in sync.
+- Avoid breaking tool schemas. When replacing a tool, keep a deprecated compatibility alias
+  (`canonical: false`, `replacement: '...'`) where practical.
+- New behavior needs a test.
 
 ## Project layout
 
 ```
 src/
-  index.ts            transport entrypoint
+  index.ts            entrypoint
   config.ts           environment configuration
   mcp.ts              server factory
-  server/http.ts      Streamable HTTP transport
+  server/http.ts      HTTP transport
   nuvio/              auth, client, snapshots, domain operations
-  tools/              MCP tool registration
+  tools/              tool registration
 test/                 unit, tool and HTTP tests + mock backend
 ```
 
@@ -50,9 +61,9 @@ test/                 unit, tool and HTTP tests + mock backend
 
 - Keep changes focused; one concern per pull request.
 - Add or update tests for behavior changes.
-- Update `README.md` or `SECURITY.md` when user-facing behavior or safety guarantees change.
+- Update `README.md` or `SECURITY.md` when user-facing behavior changes.
 - Do not commit secrets, tokens or `.env` files.
 
 ## Commit messages
 
-Use short, imperative subjects, optionally with a conventional prefix (`fix:`, `docs:`, `test:`).
+Short, imperative subjects, optionally with a prefix (`fix:`, `docs:`, `test:`).

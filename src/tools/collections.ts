@@ -62,13 +62,13 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
     risk: 'write',
     resource,
     schema: { profile_id: profile, collection: collectionSchema },
-    handler: (args) =>
+    handler: (args, ctx) =>
       collections.createCollection(
         client,
         args.profile_id,
         normalizeCollection(args.collection),
         originId,
-        true
+        ctx.apply
       ),
   });
 
@@ -83,7 +83,7 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
       collection_id: z.string(),
       changes: collectionSchema.omit({ id: true }).partial(),
     },
-    handler: (args) => {
+    handler: (args, ctx) => {
       const { folders, ...rest } = args.changes;
       const changes = folders ? { ...rest, folders: folders.map(normalizeFolder) } : rest;
       return collections.updateCollection(
@@ -92,7 +92,7 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
         args.collection_id,
         changes,
         originId,
-        true
+        ctx.apply
       );
     },
   });
@@ -115,14 +115,14 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
     risk: 'write',
     resource,
     schema: { profile_id: profile, collection_id: z.string(), folder: folderSchema },
-    handler: (args) =>
+    handler: (args, ctx) =>
       collections.addFolder(
         client,
         args.profile_id,
         args.collection_id,
         normalizeFolder(args.folder),
         originId,
-        true
+        ctx.apply
       ),
   });
 
@@ -138,7 +138,7 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
       folder_id: z.string(),
       changes: folderSchema.omit({ id: true }).partial(),
     },
-    handler: (args) =>
+    handler: (args, ctx) =>
       collections.updateFolder(
         client,
         args.profile_id,
@@ -146,7 +146,7 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
         args.folder_id,
         args.changes,
         originId,
-        true
+        ctx.apply
       ),
   });
 
@@ -175,8 +175,8 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
     risk: 'write',
     resource,
     schema: { profile_id: profile, ordered_ids: z.array(z.string()).min(1) },
-    handler: (args) =>
-      collections.reorderCollections(client, args.profile_id, args.ordered_ids, originId, true),
+    handler: (args, ctx) =>
+      collections.reorderCollections(client, args.profile_id, args.ordered_ids, originId, ctx.apply),
   });
 
   defineMutation(server, client, cfg, {
@@ -192,7 +192,7 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
       new_id: z.string(),
       new_title: z.string().optional(),
     },
-    handler: (args) =>
+    handler: (args, ctx) =>
       collections.duplicateCollection(
         client,
         args.profile_id,
@@ -200,7 +200,7 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
         args.new_id,
         args.new_title,
         originId,
-        true
+        ctx.apply
       ),
   });
 
@@ -216,14 +216,14 @@ export function registerCollectionTools(server: McpServer, client: NuvioClient, 
       collection_id: z.string(),
       ordered_folder_ids: z.array(z.string()).min(1),
     },
-    handler: (args) =>
+    handler: (args, ctx) =>
       collections.reorderCollectionFolders(
         client,
         args.profile_id,
         args.collection_id,
         args.ordered_folder_ids,
         originId,
-        true
+        ctx.apply
       ),
   });
 }
