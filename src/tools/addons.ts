@@ -3,7 +3,9 @@ import { z } from 'zod';
 import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
 import { NuvioError } from '../nuvio/errors.js';
+import { fetchJsonFromPublicUrl } from '../nuvio/safe-fetch.js';
 import { defineMutation, defineRead } from './helpers.js';
+import { schemeTolerantUrl } from './url.js';
 import * as addons from '../nuvio/ops/addons.js';
 
 export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
@@ -27,18 +29,7 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
     risk: 'read',
     schema: { url: z.url() },
     handler: async (args) => {
-      let parsed: URL;
-      try {
-        parsed = new URL(args.url);
-      } catch {
-        throw new NuvioError(`Invalid URL: ${args.url}`);
-      }
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        throw new NuvioError('Only http(s) addon URLs are supported');
-      }
-      const res = await fetch(args.url, { headers: { accept: 'application/json' } });
-      if (!res.ok) throw new NuvioError(`Manifest fetch failed [http ${res.status}]`);
-      const manifest = (await res.json()) as Record<string, unknown>;
+      const manifest = (await fetchJsonFromPublicUrl(args.url)) as Record<string, unknown>;
       return {
         id: manifest.id,
         name: manifest.name,
@@ -82,7 +73,7 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
     resource: (args) => ({ kind: 'addons', profile_id: args.profile_id }),
     schema: {
       profile_id: profile,
-      url: z.url().optional(),
+      url: schemeTolerantUrl.optional(),
       id: z.uuid().optional(),
       name: z.string().nullable().optional(),
       enabled: z.boolean().optional(),
@@ -103,7 +94,7 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
     resource: (args) => ({ kind: 'addons', profile_id: args.profile_id }),
     schema: {
       profile_id: profile,
-      url: z.url().optional(),
+      url: schemeTolerantUrl.optional(),
       id: z.uuid().optional(),
       enabled: z.boolean(),
     },
@@ -127,7 +118,7 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
     resource: (args) => ({ kind: 'addons', profile_id: args.profile_id }),
     schema: {
       profile_id: profile,
-      ordered_urls: z.array(z.url()).min(1),
+      ordered_urls: z.array(schemeTolerantUrl).min(1),
     },
     handler: (args) => addons.reorderAddons(client, args.profile_id, args.ordered_urls, originId, true),
   });
@@ -140,7 +131,7 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
     resource: (args) => ({ kind: 'addons', profile_id: args.profile_id }),
     schema: {
       profile_id: profile,
-      url: z.url().optional(),
+      url: schemeTolerantUrl.optional(),
       id: z.uuid().optional(),
     },
     handler: (args, ctx) => {
