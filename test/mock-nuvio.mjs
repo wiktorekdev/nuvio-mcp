@@ -16,8 +16,19 @@ function seed() {
         avatar_url: null,
       },
     ],
-    addons: { 1: [{ url: 'https://example.com/a/manifest.json', name: 'A', enabled: true, sort_order: 0 }] },
-    plugins: { 1: [] },
+    addons: {
+      1: [{ url: 'https://example.com/a/manifest.json', name: 'A', enabled: true, sort_order: 0 }],
+      2: [
+        { url: 'v3-cinemeta.strem.io/manifest.json', name: 'Cinemeta', enabled: true, sort_order: 0 },
+        { url: 'opensubtitles-v3.strem.io/manifest.json', name: 'Subs', enabled: true, sort_order: 1 },
+      ],
+    },
+    plugins: {
+      1: [],
+      2: [
+        { url: 'v3-plugins.strem.io/plugin.js', name: 'Plug', enabled: true, sort_order: 0, repo_type: null },
+      ],
+    },
     settings: {
       '1:tv': {
         settings_json: { theme: 'dark', features: { player_settings: { auto_play_next: true } } },
@@ -288,6 +299,8 @@ export function startMockNuvio() {
     get_avatar_catalog: () => [{ id: 'avatar_cat_01', is_active: true }],
     sync_export_account_backup: () => ({ version: 1, exported_at: now() }),
     health_ping: () => ({ ok: true }),
+    set_profile_pin: () => ({}),
+    clear_profile_pin: () => ({}),
     sync_copy_profile_setup: (a) => {
       const src = store.settings[`${a.p_source_profile_id}:tv`];
       if (src && a.p_copy_tv)

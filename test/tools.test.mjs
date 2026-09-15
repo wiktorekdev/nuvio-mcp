@@ -473,3 +473,120 @@ test('unknown snapshot id yields a clear error', async () => {
   const out = await mcp.call('nuvio_undo', { snapshot_id: 'does-not-exist' });
   assert.match(out, /not found/);
 });
+
+test('scheme-less addon URLs round-trip through reorder/update/toggle/remove', async () => {
+  const cinemeta = 'v3-cinemeta.strem.io/manifest.json';
+  const subs = 'opensubtitles-v3.strem.io/manifest.json';
+  const listed = await mcp.call('nuvio_list_addons', { profile_id: 2 });
+  assert.match(listed, /v3-cinemeta\.strem\.io/);
+
+  assert.match(
+    await mcp.call('nuvio_reorder_addons', { profile_id: 2, ordered_urls: [subs, cinemeta] }),
+    /Applied/
+  );
+  const reordered = await mcp.call('nuvio_list_addons', { profile_id: 2 });
+  assert.ok(reordered.indexOf('opensubtitles-v3') < reordered.indexOf('v3-cinemeta'), 'reorder applies');
+
+  assert.match(
+    await mcp.call('nuvio_update_addon', { profile_id: 2, url: cinemeta, name: 'Cinemeta Renamed' }),
+    /Applied/
+  );
+  assert.match(
+    await mcp.call('nuvio_toggle_addon', { profile_id: 2, url: cinemeta, enabled: false }),
+    /Applied/
+  );
+
+  assert.match(await mcp.call('nuvio_remove_addon', { profile_id: 2, url: cinemeta }), /Preview/);
+  assert.match(
+    await mcp.call('nuvio_remove_addon', { profile_id: 2, url: cinemeta, confirm: true }),
+    /Applied/
+  );
+  assert.doesNotMatch(await mcp.call('nuvio_list_addons', { profile_id: 2 }), /v3-cinemeta/);
+});
+
+test('addon URL input rejects non-http schemes and junk', async () => {
+  assert.match(
+    await mcp.call('nuvio_reorder_addons', { profile_id: 1, ordered_urls: ['ftp://x.example/a'] }),
+    /validation|invalid/i
+  );
+  assert.match(
+    await mcp.call('nuvio_toggle_addon', { profile_id: 1, url: 'not a url', enabled: true }),
+    /validation|invalid/i
+  );
+});
+
+test('scheme-less plugin URLs round-trip through toggle/reorder/remove', async () => {
+  const url = 'v3-plugins.strem.io/plugin.js';
+  assert.match(await mcp.call('nuvio_list_plugins', { profile_id: 2 }), /v3-plugins\.strem\.io/);
+  assert.match(await mcp.call('nuvio_toggle_plugin', { profile_id: 2, url, enabled: false }), /Applied/);
+  assert.match(
+    await mcp.call('nuvio_reorder_plugins', { profile_id: 2, ordered_urls: [url] }),
+    /No changes|Applied/
+  );
+  assert.match(await mcp.call('nuvio_remove_plugin', { profile_id: 2, url }), /Preview/);
+  assert.match(await mcp.call('nuvio_remove_plugin', { profile_id: 2, url, confirm: true }), /Applied/);
+});
+
+test('profile PIN is masked in output, confirmation token and audit log', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const pin = 's3cretPIN';
+
+  const preview = await mcp.call('nuvio_set_profile_pin', { profile_index: 1, pin });
+  assert.ok(!preview.includes(pin), 'PIN must not appear in the preview');
+  const token = confirmationToken(preview);
+  assert.ok(token, 'preview must include a confirmation token');
+  const body = Buffer.from(token.split('.')[0], 'base64url').toString('utf8');
+  assert.ok(!body.includes(pin), 'PIN must not be readable from the confirmation token');
+
+  const applied = await mcp.call('nuvio_set_profile_pin', {
+    profile_index: 1,
+    pin,
+    confirmation_token: token,
+  });
+  assert.ok(!applied.includes(pin), 'PIN must not appear in the applied output');
+
+  const audit = fs.readFileSync(path.join(mcp.dir, 'audit.jsonl'), 'utf8');
+  assert.ok(!audit.includes(pin), 'PIN must not appear in the audit log');
+});
+
+test('inspect_addon refuses loopback and link-local targets (SSRF)', async () => {
+  assert.match(
+    await mcp.call('nuvio_inspect_addon', { url: 'http://127.0.0.1:9/manifest.json' }),
+    /private\/loopback/
+  );
+  assert.match(
+    await mcp.call('nuvio_inspect_addon', { url: 'http://169.254.169.254/latest/meta-data/' }),
+    /private\/loopback/
+  );
+});
+
+test('undo with NUVIO_DISABLE_SNAPSHOTS writes no snapshot', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const off = await startStdio(mock.url, { NUVIO_DISABLE_SNAPSHOTS: 'true' });
+  try {
+    const dir = path.join(off.dir, 'snapshots');
+    fs.mkdirSync(dir, { recursive: true });
+    const old = {
+      id: '0000000000000001-abcdef01',
+      ts: new Date().toISOString(),
+      tool: 'nuvio_set_provider_credential',
+      backend: mock.url,
+      resource: { kind: 'provider_credentials', profile_id: 1 },
+      reversible: true,
+      sensitive: true,
+      before: [],
+    };
+    fs.writeFileSync(path.join(dir, `${old.id}.json`), JSON.stringify(old));
+
+    const before = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).length;
+    const out = await off.call('nuvio_undo', { snapshot_id: old.id });
+    assert.match(out, /Reverted/);
+    assert.match(out, /Snapshots are disabled/);
+    const after = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).length;
+    assert.equal(after, before, 'undo must not write a snapshot when snapshots are disabled');
+  } finally {
+    await off.close();
+  }
+});
