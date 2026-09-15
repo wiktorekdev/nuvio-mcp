@@ -122,15 +122,6 @@ removed on demand with `nuvio_prune_snapshots`. See [`.env.example`](.env.exampl
 
 See [SECURITY.md](SECURITY.md) for the full security model.
 
-## Batched changes: `nuvio_apply_plan`
-
-`nuvio_apply_plan` runs several mutations in one call. The whole batch is validated before anything
-is written, and if a write fails the server attempts a rollback. The Nuvio backend does not offer
-atomic multi-resource transactions, so the rollback is best-effort: the result reports whether it
-completed (`applied`, `rolled_back`, `partially_applied`). It defaults to `dry_run`.
-
-Regular mutation tools support `dry_run`, which returns the planned diff without writing.
-
 ## Development
 
 ```bash
