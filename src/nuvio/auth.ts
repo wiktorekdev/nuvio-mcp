@@ -9,6 +9,7 @@ export interface AuthConfig {
   password?: string;
   refreshToken?: string;
   sessionFile: string;
+  timeoutMs?: number;
 }
 
 interface SessionFile {
@@ -97,6 +98,7 @@ export class AuthManager {
         apikey: this.cfg.publishableKey,
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 15_000),
     });
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFromResponse(res.status, json);

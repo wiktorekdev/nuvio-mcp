@@ -23,6 +23,7 @@ async function main(): Promise<void> {
     password: cfg.password,
     refreshToken: cfg.refreshToken,
     sessionFile: cfg.sessionFile,
+    timeoutMs: Math.min(cfg.backendTimeoutMs, 15_000),
   });
   const client = new NuvioClient(cfg, auth);
 

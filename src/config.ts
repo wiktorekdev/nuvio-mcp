@@ -25,6 +25,8 @@ export interface NuvioConfig {
   sessionFile: string;
   auditFile: string;
   snapshotDir: string;
+  /** Timeout for outbound requests to the Nuvio backend. */
+  backendTimeoutMs: number;
   /** When true, no snapshots are written and reversible changes cannot be undone. */
   disableSnapshots: boolean;
   transport: Transport;
@@ -49,11 +51,9 @@ const OFFICIAL_PUBLISHABLE_KEY = 'sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN
 
 function loadEnvFiles(): void {
   const here = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    resolve(process.cwd(), '.env'),
-    resolve(here, '..', '.env'),
-    resolve(here, '..', '..', '.env'),
-  ];
+  // Only package-relative .env files: never the current working directory, which
+  // may be attacker-controlled (e.g. `npx nuvio-mcp` inside an untrusted repo).
+  const candidates = [resolve(here, '..', '.env'), resolve(here, '..', '..', '.env')];
   const load = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
   if (typeof load !== 'function') return;
   for (const file of candidates) {
@@ -105,6 +105,7 @@ export function loadConfig(): NuvioConfig {
     sessionFile: process.env.NUVIO_SESSION_FILE?.trim() || join(dataDir, 'session.json'),
     auditFile: process.env.NUVIO_AUDIT_FILE?.trim() || join(dataDir, 'audit.jsonl'),
     snapshotDir: process.env.NUVIO_SNAPSHOT_DIR?.trim() || join(dataDir, 'snapshots'),
+    backendTimeoutMs: int(process.env.NUVIO_BACKEND_TIMEOUT_MS, 30_000),
     disableSnapshots: bool(process.env.NUVIO_DISABLE_SNAPSHOTS, false),
     transport,
     http: {
