@@ -3,19 +3,9 @@ import { z } from 'zod';
 import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
 import { defineMutation, defineRead } from './helpers.js';
+import { getSettingsShape, profile, platform, updateSettingsShape } from '../nuvio/schemas.js';
 import * as settings from '../nuvio/ops/settings.js';
-
-const platform = z.string().default('tv').describe('Platform namespace: tv | mobile | desktop | web');
-const profile = z.number().int().min(1).max(6).default(1);
-
-const editShape = {
-  patch: z.record(z.string(), z.unknown()).optional().describe('Deep-merged into the settings tree.'),
-  set: z
-    .array(z.object({ path: z.string().min(1), value: z.unknown() }))
-    .optional()
-    .describe('Set nested values by dot path, applied after patch.'),
-  unset: z.array(z.string().min(1)).optional().describe('Delete nested keys by dot path, applied last.'),
-};
+import * as profiles from '../nuvio/ops/profiles.js';
 
 export function registerSettingsTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
   const originId = cfg.originClientId;
@@ -29,7 +19,7 @@ export function registerSettingsTools(server: McpServer, client: NuvioClient, cf
     title: 'Get profile settings',
     description: 'Read the JSON settings blob for a profile on a platform.',
     risk: 'read',
-    schema: { profile_id: profile, platform },
+    schema: getSettingsShape,
     handler: (args) => settings.getSettings(client, args.profile_id, args.platform),
   });
 
@@ -42,7 +32,7 @@ export function registerSettingsTools(server: McpServer, client: NuvioClient, cf
       'This is the canonical replacement for nuvio_set_setting / nuvio_unset_setting.',
     risk: 'write',
     resource: settingsResource,
-    schema: { profile_id: profile, platform, ...editShape },
+    schema: updateSettingsShape,
     handler: (args, ctx) =>
       settings.updateSettings(client, args.profile_id, args.platform, args, originId, ctx.apply),
   });
@@ -54,7 +44,7 @@ export function registerSettingsTools(server: McpServer, client: NuvioClient, cf
       'Update the home screen layout/catalog blob with the same patch/set/unset semantics as nuvio_update_settings.',
     risk: 'write',
     resource: homeResource,
-    schema: { profile_id: profile, platform, ...editShape },
+    schema: updateSettingsShape,
     handler: (args, ctx) =>
       settings.updateHomeCatalogSettings(client, args.profile_id, args.platform, args, originId, ctx.apply),
   });
@@ -64,7 +54,7 @@ export function registerSettingsTools(server: McpServer, client: NuvioClient, cf
     title: 'Get home catalog settings',
     description: 'Read the home screen layout/catalog configuration for a profile on a platform.',
     risk: 'read',
-    schema: { profile_id: profile, platform },
+    schema: getSettingsShape,
     handler: (args) => settings.getHomeCatalogSettings(client, args.profile_id, args.platform),
   });
 
@@ -146,10 +136,20 @@ export function registerSettingsTools(server: McpServer, client: NuvioClient, cf
       to_platform: platform,
     },
     handler: (args, ctx) =>
-      settings.copySettings(
+      profiles.copySetup(
         client,
-        { profile_id: args.from_profile_id, platform: args.from_platform },
-        { profile_id: args.to_profile_id, platform: args.to_platform },
+        {
+          source_profile_id: args.from_profile_id,
+          target_profile_id: args.to_profile_id,
+          platforms: [
+            {
+              from: args.from_platform as profiles.SetupPlatform,
+              to: args.to_platform as profiles.SetupPlatform,
+            },
+          ],
+          settings_mode: 'replace',
+          provider_credentials: 'none',
+        },
         originId,
         ctx.apply
       ),

@@ -1,6 +1,7 @@
 import { NuvioError } from '../errors.js';
 import type { NuvioClient } from '../client.js';
 import type { ApplyResult } from '../types.js';
+import { readAllLibrary, readAllWatchHistory, readAllWatchProgress } from './readers.js';
 
 export interface LibraryItem {
   content_id: string;
@@ -49,8 +50,6 @@ export interface HistoryKey {
   episode?: number | null;
 }
 
-const FETCH_LIMIT = 1000;
-
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === 'object') {
@@ -85,6 +84,21 @@ export function historyKeyOf(item: HistoryKey): string {
 /** Public alias used by tests/consumers. */
 export const historyKeyFrom = historyKeyOf;
 
+function storedProgressKey(item: Record<string, unknown>): string {
+  if (typeof item.progress_key === 'string' && item.progress_key) return item.progress_key;
+  return progressKeyOf(item as unknown as ProgressKey);
+}
+
+function requireKeys(item: { content_id?: string; content_type?: string }, what: string): void {
+  if (!item.content_id || !item.content_type) {
+    throw new NuvioError(`${what}: content_id and content_type are required`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reads (public list tools keep their own pagination shape)
+// ---------------------------------------------------------------------------
+
 export async function getLibrary(
   client: NuvioClient,
   profileId: number,
@@ -115,13 +129,10 @@ export async function getWatchHistory(
   });
 }
 
-function requireKeys(item: { content_id?: string; content_type?: string }, what: string): void {
-  if (!item.content_id || !item.content_type) {
-    throw new NuvioError(`${what}: content_id and content_type are required`);
-  }
-}
+// ---------------------------------------------------------------------------
+// Mutations (complete readers; deletes are not gated on a first page)
+// ---------------------------------------------------------------------------
 
-/** Add or update many library items in one request. Repeated identical calls are no-ops. */
 export async function addToLibrary(
   client: NuvioClient,
   profileId: number,
@@ -131,7 +142,7 @@ export async function addToLibrary(
 ): Promise<ApplyResult<unknown[]>> {
   if (items.length === 0) throw new NuvioError('At least one item is required');
   for (const item of items) requireKeys(item, 'add_to_library');
-  const before = (await getLibrary(client, profileId, FETCH_LIMIT, 0)) as Array<Record<string, unknown>>;
+  const before = (await readAllLibrary(client, profileId)) as Array<Record<string, unknown>>;
   const byKey = new Map(before.map((i) => [`${i.content_type}:${i.content_id}`, i]));
   const after = structuredClone(before);
   const diff: string[] = [];
@@ -165,10 +176,11 @@ export async function removeFromLibrary(
   apply: boolean
 ): Promise<ApplyResult<unknown[]>> {
   if (keys.length === 0) throw new NuvioError('At least one key is required');
-  const before = (await getLibrary(client, profileId, FETCH_LIMIT, 0)) as Array<Record<string, unknown>>;
+  const before = (await readAllLibrary(client, profileId)) as Array<Record<string, unknown>>;
   const wanted = new Set(keys.map((k) => `${k.content_type}:${k.content_id}`));
-  const present = before.filter((i) => wanted.has(`${i.content_type}:${i.content_id}`));
-  if (apply && present.length > 0) {
+  // Always send the delete for the provided keys — the backend is the source of
+  // truth, not the read page. This makes items beyond any page boundary deletable.
+  if (apply) {
     await client.rpc('sync_delete_library_items', {
       p_profile_id: profileId,
       p_keys: keys,
@@ -176,15 +188,14 @@ export async function removeFromLibrary(
     });
   }
   return {
-    applied: apply && present.length > 0,
-    changed: present.length > 0,
+    applied: apply,
+    changed: keys.length > 0,
     before,
-    after: before,
+    after: before.filter((i) => !wanted.has(`${i.content_type}:${i.content_id}`)),
     diff: keys.map((k) => `- library ${k.content_type}:${k.content_id}`),
   };
 }
 
-/** Upsert many continue-watching entries in one request. */
 export async function setWatchProgress(
   client: NuvioClient,
   profileId: number,
@@ -194,25 +205,21 @@ export async function setWatchProgress(
 ): Promise<ApplyResult<unknown[]>> {
   if (entries.length === 0) throw new NuvioError('At least one entry is required');
   for (const entry of entries) requireKeys(entry, 'set_watch_progress');
-  const before = (await getWatchProgress(client, profileId, FETCH_LIMIT)) as Array<Record<string, unknown>>;
-  const byKey = new Map(before.map((p) => [progressKeyOf(p as unknown as ProgressKey), p]));
+  const before = (await readAllWatchProgress(client, profileId)) as Array<Record<string, unknown>>;
+  const byKey = new Map(before.map((p) => [storedProgressKey(p), p]));
   const after = structuredClone(before);
   const diff: string[] = [];
   const toPush: WatchProgressEntry[] = [];
   for (const entry of entries) {
     const key = progressKeyOf(entry);
     const previous = byKey.get(key);
-    const merged = {
-      ...previous,
-      ...entry,
-      last_watched: entry.last_watched ?? nowSeconds(),
-    };
+    const merged = { ...previous, ...entry, last_watched: entry.last_watched ?? nowSeconds() };
     const scope = entry.season != null ? ` S${entry.season}E${entry.episode}` : '';
     if (previous && same(previous, merged)) continue;
     diff.push(
       `~ progress ${entry.content_type}:${entry.content_id}${scope} @ ${entry.position}/${entry.duration}`
     );
-    const index = after.findIndex((p) => progressKeyOf(p as unknown as ProgressKey) === key);
+    const index = after.findIndex((p) => storedProgressKey(p) === key);
     if (index >= 0) after[index] = merged as Record<string, unknown>;
     else after.push(merged as Record<string, unknown>);
     toPush.push(merged as WatchProgressEntry);
@@ -227,10 +234,6 @@ export async function setWatchProgress(
   return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
 }
 
-/**
- * Idempotent watch-history upsert keyed by content_id + season + episode. A
- * repeated identical request is a no-op and never creates a duplicate row.
- */
 export async function addToWatchHistory(
   client: NuvioClient,
   profileId: number,
@@ -240,7 +243,7 @@ export async function addToWatchHistory(
 ): Promise<ApplyResult<unknown[]>> {
   if (items.length === 0) throw new NuvioError('At least one item is required');
   for (const item of items) requireKeys(item, 'add_to_watch_history');
-  const before = (await getWatchHistory(client, profileId, 1, FETCH_LIMIT)) as Array<Record<string, unknown>>;
+  const before = (await readAllWatchHistory(client, profileId)) as Array<Record<string, unknown>>;
   const existing = new Map(before.map((i) => [historyKeyOf(i as unknown as HistoryKey), i]));
   const after = structuredClone(before);
   const diff: string[] = [];
@@ -275,7 +278,6 @@ export async function addToWatchHistory(
   return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
 }
 
-/** Delete continue-watching entries using public, structured keys. */
 export async function deleteWatchProgress(
   client: NuvioClient,
   profileId: number,
@@ -283,27 +285,29 @@ export async function deleteWatchProgress(
   originId: string,
   apply: boolean
 ): Promise<ApplyResult<unknown[]>> {
-  const before = (await getWatchProgress(client, profileId, FETCH_LIMIT)) as Array<Record<string, unknown>>;
+  if (keys.length === 0) throw new NuvioError('At least one key is required');
+  const before = (await readAllWatchProgress(client, profileId)) as Array<Record<string, unknown>>;
   const wanted = new Set(keys.map((k) => progressKeyOf(k)));
-  const internalKeys = before
-    .filter((p) => wanted.has(progressKeyOf(p as unknown as ProgressKey)))
-    .map((p) =>
-      typeof p.progress_key === 'string' && p.progress_key
-        ? p.progress_key
-        : progressKeyOf(p as unknown as ProgressKey)
-    );
-  if (apply && internalKeys.length > 0) {
+  // Derive the internal key from the structured key so a record outside the read
+  // batch is still deletable; include any stored key we did observe.
+  const internalKeys = new Set<string>();
+  for (const key of keys) internalKeys.add(progressKeyOf(key));
+  for (const row of before) {
+    const stored = storedProgressKey(row);
+    if (wanted.has(progressKeyOf(row as unknown as ProgressKey))) internalKeys.add(stored);
+  }
+  if (apply) {
     await client.rpc('sync_delete_watch_progress', {
       p_profile_id: profileId,
-      p_keys: internalKeys,
+      p_keys: [...internalKeys],
       p_origin_client_id: originId,
     });
   }
   return {
-    applied: apply && internalKeys.length > 0,
-    changed: internalKeys.length > 0,
+    applied: apply,
+    changed: keys.length > 0,
     before,
-    after: before,
+    after: before.filter((p) => !wanted.has(progressKeyOf(p as unknown as ProgressKey))),
     diff: keys.map(
       (k) => `- watch progress ${k.content_id}${k.season != null ? ` S${k.season}E${k.episode}` : ''}`
     ),
@@ -317,10 +321,10 @@ export async function deleteWatchHistory(
   originId: string,
   apply: boolean
 ): Promise<ApplyResult<unknown[]>> {
-  const before = (await getWatchHistory(client, profileId, 1, FETCH_LIMIT)) as Array<Record<string, unknown>>;
+  if (keys.length === 0) throw new NuvioError('At least one key is required');
+  const before = (await readAllWatchHistory(client, profileId)) as Array<Record<string, unknown>>;
   const wanted = new Set(keys.map((k) => historyKeyOf(k)));
-  const present = before.filter((i) => wanted.has(historyKeyOf(i as unknown as HistoryKey)));
-  if (apply && present.length > 0) {
+  if (apply) {
     await client.rpc('sync_delete_watched_items', {
       p_profile_id: profileId,
       p_keys: keys.map((k) => ({
@@ -332,10 +336,10 @@ export async function deleteWatchHistory(
     });
   }
   return {
-    applied: apply && present.length > 0,
-    changed: present.length > 0,
+    applied: apply,
+    changed: keys.length > 0,
     before,
-    after: before,
+    after: before.filter((i) => !wanted.has(historyKeyOf(i as unknown as HistoryKey))),
     diff: keys.map(
       (k) => `- watch history ${k.content_id}${k.season != null ? ` S${k.season}E${k.episode}` : ''}`
     ),

@@ -98,7 +98,14 @@ export async function getSettings(
   return rows[0] ?? null;
 }
 
-async function writeSettings(
+/** True when an error is an optimistic-concurrency rejection (guarded write). */
+export function isConcurrencyConflict(error: unknown): boolean {
+  const e = error as { code?: string; status?: number; message?: string };
+  if (e?.code === '40001' || e?.status === 409) return true;
+  return typeof e?.message === 'string' && /changed on another device|concurrency|conflict/i.test(e.message);
+}
+
+export async function writeSettings(
   client: NuvioClient,
   profileId: number,
   platform: Platform,

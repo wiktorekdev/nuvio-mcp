@@ -10,6 +10,7 @@ import {
   deleteProviderCredential,
   testProviderCredential,
 } from '../nuvio/ops/providers.js';
+import { providerSetShape } from '../nuvio/schemas.js';
 
 export function registerProviderTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
   const originId = cfg.originClientId;
@@ -44,11 +45,7 @@ export function registerProviderTools(server: McpServer, client: NuvioClient, cf
       'Store an API key for a provider: debrid:torbox, debrid:premiumize, debrid:realdebrid, tmdb, mdblist, introdb (api key) or animeskip (client id).',
     risk: 'write',
     resource,
-    schema: {
-      profile_id: profile,
-      provider: z.string().describe('One of the supported provider ids'),
-      api_key: z.string().min(1).describe('API key / client id value'),
-    },
+    schema: providerSetShape,
     handler: (args, ctx) =>
       setProviderCredential(client, args.profile_id, args.provider, args.api_key, originId, ctx.apply),
   });

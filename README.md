@@ -139,13 +139,22 @@ deletion happens only via `unset`.
 
 Apply many canonical operations as one transaction:
 
-1. validates every operation up front and rejects the whole plan if any is invalid, unsupported or
-   irreversible — before any write;
+1. validates every operation against the **exact same Zod schema** as its direct tool (types,
+   defaults, enums, URL rules, refinements and required fields), plus the same handler-level
+   validation (`url` or `id` required, supported providers). Deprecated aliases are rejected. The
+   whole plan is rejected up front if any operation is invalid, unsupported or irreversible — before
+   any write;
 2. reads each affected resource **once**, computes all changes in memory, then writes each resource
-   **once**;
-3. takes a single **composite snapshot** that can be reverted with `nuvio_undo`;
+   **once**. Settings use the same guarded write as the direct tool, so optimistic concurrency is
+   preserved: a plan never overwrites a settings change made after the plan read;
+3. takes a single **composite snapshot** whose **per-resource scope** records exactly which keys
+   (library / watch-progress / watch-history) were touched, so `nuvio_undo` can restore the precise
+   pre-plan state;
 4. on failure, rolls back and reports an explicit status: `preview`, `applied`, `rolled_back`,
    `partially_applied` or `failed_before_apply` (with per-operation and per-resource diffs).
+   `failed_before_apply` is used **only** when no backend write was attempted; once a write starts,
+   the result is conservative and never claims nothing was written. A guarded-write conflict is
+   reported without blindly overwriting the newer concurrent state.
 
 ```jsonc
 {
@@ -162,8 +171,8 @@ Apply many canonical operations as one transaction:
 
 ## Retry safety
 
-- Reads (GET, and read RPCs) retry network errors and `408/429/500/502/503/504` with exponential
-  backoff and `Retry-After`.
+- Reads (GET, and read RPCs, including backup export) retry network errors and
+  `408/429/500/502/503/504` with exponential backoff, bounded jitter and `Retry-After`.
 - Non-idempotent writes are **never** retried automatically — a lost response must not silently
   double-apply a mutation. Retry only happens for operations that are **intrinsically** idempotent.
 - An `Idempotency-Key` is informational only: the hosted backend does not deduplicate, so a key
@@ -188,10 +197,31 @@ full backup as scoped.
 Set `NUVIO_DISABLE_SNAPSHOTS=true` to never write snapshots locally: reversible changes then run
 without snapshots and cannot be undone, and no raw credentials are stored on disk.
 
-### Snapshot retention
+### Copying setup
+
+`nuvio_copy_setup` supports cross-platform mappings, including on the same profile:
+
+```jsonc
+{
+  "source_profile_id": 1,
+  "target_profile_id": 1,
+  "platforms": [{ "from": "tv", "to": "mobile" }],
+  "settings_mode": "merge",
+  "provider_credentials": "none",
+}
+```
+
+All source states are read before any write, so chained mappings (`tv -> mobile`, then
+`mobile -> desktop`) use the original source values. An identity mapping on the same profile is a
+no-op. The deprecated `nuvio_copy_settings` delegates to a single `from_platform -> to_platform`
+mapping with `settings_mode: replace`.
+
+## Snapshot retention
 
 Snapshots are garbage-collected automatically after every write, and on demand via
-`nuvio_prune_snapshots` (defaults to `dry_run`; pass `confirm: true` to delete). Limits:
+`nuvio_prune_snapshots`. That tool previews unless you pass `confirm: true`; `dry_run: true` always
+previews (even with `confirm`). The three limits below are independent (age, count, total size); the
+newest snapshot is always kept, and an explicit `keep_last` only guards a manual prune. Limits:
 
 | Variable                         | Default    | Meaning                                         |
 | -------------------------------- | ---------- | ----------------------------------------------- |

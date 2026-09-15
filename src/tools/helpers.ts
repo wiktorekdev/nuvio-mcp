@@ -10,10 +10,9 @@ import { NuvioError } from '../nuvio/errors.js';
 import {
   capture,
   captureComposite,
-  getSnapshot,
   readResource,
   removeSnapshot,
-  restore,
+  restoreResource,
   SnapshotError,
   type ResourceRef,
   type Snapshot,
@@ -360,8 +359,9 @@ export function defineLocalMutation<S extends z.ZodRawShape>(
     dry_run: z
       .boolean()
       .optional()
-      .default(true)
-      .describe('Default true: only reports what would be removed.'),
+      .describe(
+        'Force a preview. Without `confirm` the operation always previews, even if dry_run is false.'
+      ),
     confirm: z.boolean().optional().describe('Required to actually delete. Without it nothing is removed.'),
   } as z.ZodRawShape;
 
@@ -369,7 +369,7 @@ export function defineLocalMutation<S extends z.ZodRawShape>(
     spec.name,
     {
       title: spec.title,
-      description: `${spec.description} Destructive local operation: defaults to dry_run and requires confirm to delete.`,
+      description: `${spec.description} Destructive local operation: previews unless confirm=true; dry_run=true always previews.`,
       inputSchema: z.object(shape),
       annotations: {
         readOnlyHint: false,
@@ -381,8 +381,9 @@ export function defineLocalMutation<S extends z.ZodRawShape>(
     (async (args: Record<string, unknown>) => {
       try {
         const typed = args as z.infer<z.ZodObject<S>>;
-        const dryRun = args.dry_run !== false;
-        const apply = !dryRun && args.confirm === true;
+        // Apply only with an explicit confirm and no explicit dry_run.
+        const apply = args.confirm === true && args.dry_run !== true;
+        const dryRun = !apply;
         const ctx: ExecCtx = {
           client,
           config: cfg,
@@ -491,20 +492,47 @@ export function definePlanMutation(server: McpServer, client: NuvioClient, cfg: 
                     reversible: true,
                     note: 'composite snapshot for a plan',
                   }).id,
-            rollback: async (id) => {
-              const snapshot = getSnapshot(cfg, id);
-              if (!snapshot) return { ok: false, detail: `snapshot ${id} not found` };
-              const report = await restore(client, cfg, snapshot);
+            rollback: async (entries) => {
+              if (cfg.disableSnapshots) {
+                return {
+                  ok: false,
+                  detail: 'Snapshots are disabled; no rollback was attempted and the final state is unknown.',
+                };
+              }
+              const outcomes: Array<{ ok: boolean; resource: string }> = [];
+              for (const entry of entries) {
+                try {
+                  const message = await restoreResource(client, cfg, entry, {
+                    id: 'nuvio_apply_plan',
+                    tool: 'nuvio_apply_plan',
+                    reversible: true,
+                  } as Snapshot);
+                  outcomes.push({ ok: true, resource: `${entry.resource.kind}:${message ? 'ok' : 'ok'}` });
+                } catch (error) {
+                  outcomes.push({
+                    ok: false,
+                    resource: `${entry.resource.kind}:${error instanceof Error ? error.message : String(error)}`,
+                  });
+                }
+              }
               return {
-                ok: report.ok,
-                detail: report.outcomes.map((o) => `${o.ok ? 'ok' : 'fail'} ${o.resource}`).join(', '),
+                ok: outcomes.every((o) => o.ok),
+                detail:
+                  outcomes.map((o) => `${o.ok ? 'ok' : 'fail'} ${o.resource}`).join(', ') ||
+                  'nothing to roll back',
               };
             },
           });
-          if (result.status === 'applied') {
+          if (['applied', 'rolled_back', 'partially_applied'].includes(result.status)) {
             audit(cfg, {
               tool: 'nuvio_apply_plan',
+              status: result.status,
               operations: args.operations,
+              attempted_resources: result.attempted_resources,
+              completed_resources: result.completed_resources,
+              applied_operations: result.applied_operations,
+              failed_operation: result.failed_operation,
+              rollback: result.rollback,
               diff: result.resources.flatMap((r) => r.diff),
               snapshot: result.snapshot_id,
             });

@@ -7,7 +7,7 @@ import { deepMerge, applySettingsEdit } from '../dist/nuvio/ops/settings.js';
 import { progressKeyOf, historyKeyFrom } from '../dist/nuvio/ops/library.js';
 import { captureComposite, getSnapshot, pruneSnapshots } from '../dist/nuvio/snapshots.js';
 import { withCallCache, callCache } from '../dist/nuvio/call-context.js';
-import { NuvioClient } from '../dist/nuvio/client.js';
+import { NuvioClient, computeRetryDelayMs } from '../dist/nuvio/client.js';
 
 // ---------------------------------------------------------------------------
 // Deep merge semantics
@@ -140,6 +140,82 @@ test('pruneSnapshots dry-run removes nothing', () => {
   );
   assert.equal(result.removed.length, 2);
   assert.equal(readdirSync(dir).length, 3);
+});
+
+test('pruneSnapshots removes old snapshots even when fewer than maxCount', () => {
+  const ids = Array.from({ length: 100 }, (_, i) => idAgo(40, i + 1));
+  const dir = snapshotDirWith(ids);
+  const result = pruneSnapshots(gcCfg(dir), {}); // maxAge=30, maxCount=250
+  assert.ok(result.removed.length >= 99, `expected most old snapshots removed, got ${result.removed.length}`);
+  assert.ok(readdirSync(dir).length <= 1);
+});
+
+test('pruneSnapshots enforces the size limit when count is low', () => {
+  const dir = snapshotDirWith([idAgo(0, 1), idAgo(0, 2), idAgo(0, 3), idAgo(0, 4)]);
+  const result = pruneSnapshots(
+    gcCfg(dir, { snapshotMaxAgeDays: 0, snapshotMaxCount: 250, snapshotMaxTotalBytes: 120 }),
+    {}
+  );
+  assert.ok(result.removed.length >= 2, 'size limit should evict some snapshots');
+  assert.ok(result.removed.every((r) => r.reason === 'size' || r.reason === 'count'));
+});
+
+test('pruneSnapshots explicit keep_last protects the newest N', () => {
+  const dir = snapshotDirWith([idAgo(0, 1), idAgo(0, 2), idAgo(0, 3)]);
+  const result = pruneSnapshots(gcCfg(dir, { snapshotMaxAgeDays: 0, snapshotMaxTotalBytes: 0 }), {
+    keepLast: 5,
+    maxCount: 0,
+  });
+  assert.equal(result.removed.length, 0);
+  assert.equal(readdirSync(dir).length, 3);
+});
+
+test('pruneSnapshots combination is deterministic', () => {
+  const dir = snapshotDirWith([idAgo(40, 1), idAgo(0, 2), idAgo(0, 3), idAgo(0, 4)]);
+  const cfg = gcCfg(dir, { snapshotMaxAgeDays: 30, snapshotMaxCount: 2, snapshotMaxTotalBytes: 0 });
+  const first = pruneSnapshots(cfg, { dryRun: true });
+  const second = pruneSnapshots(cfg, { dryRun: true });
+  assert.deepEqual(
+    first.removed.map((r) => r.id),
+    second.removed.map((r) => r.id)
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Retry jitter
+// ---------------------------------------------------------------------------
+
+test('computeRetryDelayMs applies bounded jitter and honours Retry-After', () => {
+  const mk = (headers = {}) => new Response('', { status: 429, headers });
+
+  // Equal jitter -> [cap/2, cap]; deterministic with an injected rng.
+  assert.equal(
+    computeRetryDelayMs(mk(), 0, () => 0),
+    200
+  ); // cap=400 -> half=200
+  assert.equal(
+    computeRetryDelayMs(mk(), 0, () => 1),
+    400
+  );
+  const jittered = computeRetryDelayMs(mk(), 3, () => 0.5);
+  assert.ok(jittered >= 1600 && jittered <= 3200, `jitter out of range: ${jittered}`); // cap=3200
+
+  // Cap is enforced for large attempts.
+  assert.equal(
+    computeRetryDelayMs(mk(), 20, () => 1),
+    10000
+  );
+
+  // Retry-After seconds wins.
+  assert.equal(
+    computeRetryDelayMs(mk({ 'retry-after': '7' }), 0, () => 1),
+    7000
+  );
+
+  // Retry-After HTTP-date wins.
+  const future = new Date(Date.now() + 5000).toUTCString();
+  const fromDate = computeRetryDelayMs(mk({ 'retry-after': future }), 0, () => 0);
+  assert.ok(fromDate >= 3000 && fromDate <= 6000, `date delay out of range: ${fromDate}`);
 });
 
 // ---------------------------------------------------------------------------

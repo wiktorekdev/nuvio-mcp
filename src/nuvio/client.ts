@@ -42,19 +42,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function retryDelayMs(res: Response, attempt: number): number {
-  const header = res.headers.get('retry-after');
+/**
+ * Pure retry-delay calculation (exported for tests).
+ * `Retry-After` always wins; otherwise equal jitter: half the exponential cap
+ * plus a bounded random half, so the delay stays within `[cap/2, cap]`.
+ */
+export function computeRetryDelayMs(
+  res: Response | null,
+  attempt: number,
+  rng: () => number = Math.random
+): number {
+  const header = res?.headers.get('retry-after');
   if (header) {
     const seconds = Number(header);
     if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
     const date = Date.parse(header);
     if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
   }
-  return Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  const cap = Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  const half = cap / 2;
+  return Math.floor(half + rng() * half);
 }
 
 function backoffMs(attempt: number): number {
-  return Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  return computeRetryDelayMs(null, attempt);
 }
 
 /**
@@ -108,7 +119,7 @@ export class NuvioClient {
         throw error;
       }
       if (idempotent && !options.noRetry && RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
-        await sleep(retryDelayMs(res, attempt));
+        await sleep(computeRetryDelayMs(res, attempt));
         attempt += 1;
         continue;
       }

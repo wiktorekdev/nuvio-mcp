@@ -3,55 +3,22 @@ import { z } from 'zod';
 import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
 import { defineMutation, defineRead } from './helpers.js';
+import {
+  historyAddShape,
+  historyDeleteShape,
+  historyItemSchema,
+  libraryAddShape,
+  libraryRemoveShape,
+  progressDeleteShape,
+  progressSetShape,
+  profile,
+} from '../nuvio/schemas.js';
 import * as library from '../nuvio/ops/library.js';
-
-const profile = z.number().int().min(1).max(6).default(1);
-const resource = (kind: 'library' | 'watch_progress' | 'watch_history') => (args: { profile_id: number }) =>
-  ({ kind, profile_id: args.profile_id }) as const;
-
-const progressKey = z.object({
-  content_id: z.string(),
-  season: z.number().int().nullable().optional(),
-  episode: z.number().int().nullable().optional(),
-});
 
 export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
   const originId = cfg.originClientId;
-
-  const libraryItem = z.object({
-    content_id: z.string(),
-    content_type: z.string(),
-    name: z.string().nullable().optional(),
-    poster: z.string().nullable().optional(),
-    poster_shape: z.string().nullable().optional(),
-    background: z.string().nullable().optional(),
-    description: z.string().nullable().optional(),
-    release_info: z.string().nullable().optional(),
-    imdb_rating: z.number().nullable().optional(),
-    genres: z.array(z.string()).nullable().optional(),
-    addon_base_url: z.string().nullable().optional(),
-    added_at: z.number().int().nullable().optional(),
-  });
-
-  const progressEntry = z.object({
-    content_id: z.string(),
-    content_type: z.string(),
-    video_id: z.string().nullable().optional(),
-    season: z.number().int().nullable().optional(),
-    episode: z.number().int().nullable().optional(),
-    position: z.number(),
-    duration: z.number(),
-    last_watched: z.number().int().nullable().optional(),
-  });
-
-  const historyItem = z.object({
-    content_id: z.string(),
-    content_type: z.string(),
-    title: z.string().nullable().optional(),
-    season: z.number().int().nullable().optional(),
-    episode: z.number().int().nullable().optional(),
-    watched_at: z.number().int().nullable().optional(),
-  });
+  const resource = (kind: 'library' | 'watch_progress' | 'watch_history') => (args: { profile_id: number }) =>
+    ({ kind, profile_id: args.profile_id }) as const;
 
   defineRead(server, client, cfg, {
     name: 'nuvio_get_library',
@@ -73,7 +40,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
     risk: 'write',
     resource: resource('library'),
     scope: (args) => args.items.map((i) => ({ content_id: i.content_id, content_type: i.content_type })),
-    schema: { profile_id: profile, items: z.array(libraryItem).min(1) },
+    schema: libraryAddShape,
     handler: (args, ctx) => library.addToLibrary(client, args.profile_id, args.items, originId, ctx.apply),
   });
 
@@ -84,10 +51,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
     risk: 'destructive',
     resource: resource('library'),
     scope: (args) => args.keys,
-    schema: {
-      profile_id: profile,
-      keys: z.array(z.object({ content_id: z.string(), content_type: z.string() })).min(1),
-    },
+    schema: libraryRemoveShape,
     handler: (args, ctx) =>
       library.removeFromLibrary(client, args.profile_id, args.keys, originId, ctx.apply),
   });
@@ -97,7 +61,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
     title: 'Get watch progress',
     description: 'List "continue watching" progress entries for a profile.',
     risk: 'read',
-    schema: { profile_id: profile, limit: z.number().int().min(1).max(1000).default(100) },
+    schema: { profile_id: profile, limit: z.number().int().min(1).max(100000).default(100) },
     handler: (args) => library.getWatchProgress(client, args.profile_id, args.limit),
   });
 
@@ -109,7 +73,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
     risk: 'write',
     resource: resource('watch_progress'),
     scope: (args) => args.entries.map((e) => library.progressKeyOf(e)),
-    schema: { profile_id: profile, entries: z.array(progressEntry).min(1) },
+    schema: progressSetShape,
     handler: (args, ctx) =>
       library.setWatchProgress(client, args.profile_id, args.entries, originId, ctx.apply),
   });
@@ -122,7 +86,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
     risk: 'destructive',
     resource: resource('watch_progress'),
     scope: (args) => args.keys.map((k) => library.progressKeyOf(k)),
-    schema: { profile_id: profile, keys: z.array(progressKey).min(1) },
+    schema: progressDeleteShape,
     handler: (args, ctx) =>
       library.deleteWatchProgress(client, args.profile_id, args.keys, originId, ctx.apply),
   });
@@ -154,7 +118,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
         season: i.season ?? null,
         episode: i.episode ?? null,
       })),
-    schema: { profile_id: profile, items: z.array(historyItem).min(1) },
+    schema: historyAddShape,
     handler: (args, ctx) =>
       library.addToWatchHistory(client, args.profile_id, args.items, originId, ctx.apply),
   });
@@ -166,7 +130,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
     risk: 'destructive',
     resource: resource('watch_history'),
     scope: (args) => args.keys,
-    schema: { profile_id: profile, keys: z.array(progressKey).min(1) },
+    schema: historyDeleteShape,
     handler: (args, ctx) =>
       library.deleteWatchHistory(client, args.profile_id, args.keys, originId, ctx.apply),
   });
@@ -186,7 +150,7 @@ export function registerLibraryTools(server: McpServer, client: NuvioClient, cfg
         episode: args.item.episode ?? null,
       },
     ],
-    schema: { profile_id: profile, item: historyItem },
+    schema: { profile_id: profile, item: historyItemSchema },
     handler: (args, ctx) =>
       library.addToWatchHistory(client, args.profile_id, [args.item], originId, ctx.apply),
   });

@@ -15,6 +15,7 @@ import { join, resolve, sep } from 'node:path';
 import type { NuvioConfig } from '../config.js';
 import type { NuvioClient } from './client.js';
 import { NuvioError } from './errors.js';
+import { readAllLibrary, readAllWatchHistory, readAllWatchProgress } from './ops/readers.js';
 
 /** Thrown when a mandatory pre-mutation snapshot cannot be persisted. */
 export class SnapshotError extends Error {
@@ -47,6 +48,11 @@ export type ResourceRef =
 export interface SnapshotResourceEntry {
   resource: ResourceRef;
   before: unknown;
+  /**
+   * Identities touched for THIS resource (e.g. library/progress/history keys),
+   * used for precise, truncation-safe undo. Scoped per resource, never global.
+   */
+  scope?: unknown;
 }
 
 export interface Snapshot {
@@ -72,7 +78,9 @@ export interface Snapshot {
 /** Normalise a snapshot to its resource entries, regardless of single/composite shape. */
 export function snapshotResources(s: Snapshot): SnapshotResourceEntry[] {
   if (s.resources && s.resources.length > 0) return s.resources;
-  if (s.resource) return [{ resource: s.resource, before: s.before }];
+  // Backward compatibility: legacy single-resource snapshots stored `scope` at
+  // the top level. Normalise it onto the resource entry.
+  if (s.resource) return [{ resource: s.resource, before: s.before, scope: s.scope }];
   return [];
 }
 
@@ -206,8 +214,11 @@ export interface PruneResult {
 
 /** Delete old/large snapshots according to the retention limits. */
 export function pruneSnapshots(cfg: NuvioConfig, options: PruneOptions = {}): PruneResult {
+  // Three independent limits. `keep_last` is NOT the count limit; it defaults to
+  // 0 so age and size limits stay effective. The newest snapshot is always kept
+  // so a GC pass can never delete the snapshot it was just written for.
   const olderThanDays = options.olderThanDays ?? cfg.snapshotMaxAgeDays;
-  const keepLast = options.keepLast ?? cfg.snapshotMaxCount;
+  const keepLast = Math.max(options.keepLast ?? 0, 1);
   const maxCount = options.maxCount ?? cfg.snapshotMaxCount;
   const maxTotalBytes = options.maxTotalBytes ?? cfg.snapshotMaxTotalBytes;
 
@@ -307,9 +318,6 @@ export function findLastUndo(cfg: NuvioConfig): Snapshot | null {
   return listSnapshots(cfg, 500).find((s) => s.tool === 'nuvio_undo' && s.reversible) ?? null;
 }
 
-const PAGE = 1000;
-const MAX_ROWS = 20_000;
-
 function strip<T extends Record<string, unknown>>(rows: T[], keys: string[]): Array<Record<string, unknown>> {
   return rows.map((row) => {
     const out: Record<string, unknown> = {};
@@ -396,34 +404,12 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
       });
       return rows[0]?.collections_json ?? [];
     }
-    case 'library': {
-      const all: unknown[] = [];
-      for (let offset = 0; offset < MAX_ROWS; offset += PAGE) {
-        const page = await client.readRpc<unknown[]>('sync_pull_library', {
-          p_profile_id: ref.profile_id,
-          p_limit: PAGE,
-          p_offset: offset,
-        });
-        all.push(...page);
-        if (page.length < PAGE) break;
-      }
-      return all;
-    }
+    case 'library':
+      return readAllLibrary(client, ref.profile_id);
     case 'watch_progress':
-      return client.readRpc('sync_pull_watch_progress', { p_profile_id: ref.profile_id, p_limit: PAGE });
-    case 'watch_history': {
-      const all: unknown[] = [];
-      for (let page = 1; (page - 1) * PAGE < MAX_ROWS; page += 1) {
-        const rows = await client.readRpc<unknown[]>('sync_pull_watched_items', {
-          p_profile_id: ref.profile_id,
-          p_page: page,
-          p_page_size: PAGE,
-        });
-        all.push(...rows);
-        if (rows.length < PAGE) break;
-      }
-      return all;
-    }
+      return readAllWatchProgress(client, ref.profile_id);
+    case 'watch_history':
+      return readAllWatchHistory(client, ref.profile_id);
     case 'provider_credentials':
       return client.readRpc('sync_pull_provider_credentials', { p_profile_id: ref.profile_id });
     case 'tracker_tokens':
@@ -565,7 +551,7 @@ export async function restoreResource(
       return `Restored collections for profile ${r.profile_id}.`;
     case 'library': {
       const beforeRows = before as Array<Record<string, unknown>>;
-      const scope = (snapshot.scope as Array<{ content_id: string; content_type: string }> | undefined) ?? [];
+      const scope = (entry.scope as Array<{ content_id: string; content_type: string }> | undefined) ?? [];
       const beforeKeys = new Set(beforeRows.map((i) => `${i.content_type}:${i.content_id}`));
       const remove = scope.filter((k) => !beforeKeys.has(`${k.content_type}:${k.content_id}`));
       if (remove.length > 0) {
@@ -586,7 +572,7 @@ export async function restoreResource(
     }
     case 'watch_progress': {
       const beforeRows = before as Array<Record<string, unknown>>;
-      const scope = (snapshot.scope as string[] | undefined) ?? [];
+      const scope = (entry.scope as string[] | undefined) ?? [];
       const beforeKeys = new Set(beforeRows.map((p) => progressKeyOf(p)));
       const remove = scope.filter((key) => !beforeKeys.has(key));
       if (remove.length > 0) {
@@ -607,7 +593,7 @@ export async function restoreResource(
     }
     case 'watch_history': {
       const beforeRows = before as Array<Record<string, unknown>>;
-      const scope = (snapshot.scope as Array<Record<string, unknown>> | undefined) ?? [];
+      const scope = (entry.scope as Array<Record<string, unknown>> | undefined) ?? [];
       const beforeKeys = new Set(beforeRows.map((i) => historyKeyOf(i)));
       const remove = scope.filter((k) => !beforeKeys.has(historyKeyOf(k)));
       if (remove.length > 0) {

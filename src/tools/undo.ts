@@ -94,6 +94,7 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
         composite: snapshot.composite ?? false,
         resources: snapshotResources(snapshot).map((e) => ({
           resource: e.resource,
+          scope: e.scope === undefined ? undefined : maskDeep(e.scope),
           before: maskDeep(e.before),
         })),
         reversible: snapshot.reversible,

@@ -120,7 +120,11 @@ test('apply_plan: 10 ops on one resource → 1 read and 1 write', async () => {
   const out = await mcp.call('nuvio_apply_plan', { operations: tenSettingsOps, dry_run: false });
   assert.match(out, /Plan applied/);
   assert.equal(calls('sync_pull_profile_settings_blob'), 1, 'one read for the resource');
-  assert.equal(calls('sync_push_profile_settings_blob'), 1, 'one write for the resource');
+  assert.equal(
+    calls('sync_push_profile_settings_blob') + calls('sync_push_profile_settings_blob_guarded'),
+    1,
+    'one write for the resource'
+  );
   const settings = parse(await mcp.call('nuvio_get_settings', { profile_id: 1, platform: 'tv' }));
   for (let i = 0; i < 10; i += 1) assert.equal(settings.settings_json.features[`plan_k${i}`], i);
 });
@@ -206,9 +210,9 @@ test('apply_plan rejects an irreversible operation before writing', async () => 
   assert.equal(calls('sync_delete_profile_data'), 0);
 });
 
-test('apply_plan: failure of the first write is reported as failed_before_apply', async () => {
+test('apply_plan: a failed first write is never reported as failed_before_apply', async () => {
   reset();
-  mock.failRpc('sync_push_profile_settings_blob', 1);
+  mock.failRpc('sync_push_profile_settings_blob_guarded', 1);
   const out = await mcp.call('nuvio_apply_plan', {
     operations: [
       {
@@ -218,8 +222,8 @@ test('apply_plan: failure of the first write is reported as failed_before_apply'
     ],
     dry_run: false,
   });
-  assert.match(out, /rejected before any write/);
-  assert.ok(calls('sync_push_profile_settings_blob') >= 1, 'the write was attempted');
+  assert.doesNotMatch(out, /rejected before any write/);
+  assert.match(out, /rolled back/);
   const settings = parse(await mcp.call('nuvio_get_settings', { profile_id: 1, platform: 'tv' }));
   assert.equal(settings.settings_json.features?.f1, undefined, 'nothing was applied');
 });

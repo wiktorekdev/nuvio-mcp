@@ -109,9 +109,11 @@ export function registerProfileTools(server: McpServer, client: NuvioClient, cfg
       source_profile_id: index,
       target_profile_id: index,
       platforms: z
-        .array(z.enum(profiles.SETUP_PLATFORMS))
+        .array(z.object({ from: z.enum(profiles.SETUP_PLATFORMS), to: z.enum(profiles.SETUP_PLATFORMS) }))
         .optional()
-        .describe('Defaults to tv, mobile, desktop'),
+        .describe(
+          'Platform mappings (e.g. tv -> mobile). Defaults to tv->tv, mobile->mobile, desktop->desktop.'
+        ),
       settings_mode: z.enum(['merge', 'replace']).optional().default('merge'),
       provider_credentials: z.enum(['none', 'merge', 'replace']).optional().default('none'),
     },

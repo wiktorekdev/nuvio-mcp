@@ -69,6 +69,7 @@ export function startMockNuvio() {
   const store = seed();
   const counts = {};
   const failures = new Map();
+  const hooks = new Map();
   const bump = (name) => {
     counts[name] = (counts[name] ?? 0) + 1;
   };
@@ -342,6 +343,12 @@ export function startMockNuvio() {
         const handler = rpc[name];
         if (!handler) return json(res, 404, { code: 'PGRST202', message: `Could not find function ${name}` });
         bump(name);
+        const hook = hooks.get(name);
+        if (hook) {
+          hooks.delete(name);
+          const args = body ? JSON.parse(body) : {};
+          hook(args);
+        }
         const failure = injected(name);
         if (failure) return json(res, failure.status, failure.body);
         try {
@@ -375,6 +382,8 @@ export function startMockNuvio() {
         },
         failRpc: (name, times = 1) => failures.set(name, times),
         clearFailures: () => failures.clear(),
+        once: (name, fn) => hooks.set(name, fn),
+        clearHooks: () => hooks.clear(),
       });
     });
   });

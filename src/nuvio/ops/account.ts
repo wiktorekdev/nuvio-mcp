@@ -82,14 +82,15 @@ export async function exportBackup(
   const requested = Boolean(
     options.scope?.length || options.profile_ids?.length || options.platforms?.length
   );
-  if (!requested) return client.rpc('sync_export_account_backup', {});
+  // Backup export is a read: use the cached, retry-safe read path.
+  if (!requested) return client.readRpc('sync_export_account_backup', {});
 
   const args: Record<string, unknown> = {};
   if (options.scope?.length) args.p_scope = options.scope;
   if (options.profile_ids?.length) args.p_profile_ids = options.profile_ids;
   if (options.platforms?.length) args.p_platforms = options.platforms;
 
-  const backup = await client.rpc('sync_export_account_backup', args);
+  const backup = await client.readRpc('sync_export_account_backup', args);
   if (verifyScopeApplied(backup, options)) {
     return { backup, scope_requested: options, scope_verified: true };
   }

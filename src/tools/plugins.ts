@@ -2,14 +2,20 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
-import { NuvioError } from '../nuvio/errors.js';
 import { defineMutation, defineRead } from './helpers.js';
+import {
+  assertTarget,
+  pluginAddShape,
+  pluginRemoveShape,
+  pluginReorderShape,
+  pluginUpdateShape,
+  profile,
+} from '../nuvio/schemas.js';
 import { schemeTolerantUrl } from './url.js';
 import * as plugins from '../nuvio/ops/plugins.js';
 
 export function registerPluginTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
   const originId = cfg.originClientId;
-  const profile = z.number().int().min(1).max(6).default(1);
   const resource = (args: { profile_id: number }) =>
     ({ kind: 'plugins', profile_id: args.profile_id }) as const;
 
@@ -28,13 +34,7 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
     description: 'Install a plugin on a profile by URL, preserving the existing plugin list.',
     risk: 'write',
     resource,
-    schema: {
-      profile_id: profile,
-      url: z.url(),
-      name: z.string().optional(),
-      repo_type: z.string().optional(),
-      enabled: z.boolean().optional().default(true),
-    },
+    schema: pluginAddShape,
     handler: (args, ctx) => plugins.addPlugin(client, args.profile_id, args, originId, ctx.apply),
   });
 
@@ -45,17 +45,9 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
       'Change a plugin name, enabled flag, repo type or sort order. Identify it by url or table id.',
     risk: 'write',
     resource,
-    schema: {
-      profile_id: profile,
-      url: schemeTolerantUrl.optional(),
-      id: z.uuid().optional(),
-      name: z.string().nullable().optional(),
-      enabled: z.boolean().optional(),
-      repo_type: z.string().nullable().optional(),
-      sort_order: z.number().int().optional(),
-    },
+    schema: pluginUpdateShape,
     handler: (args, ctx) => {
-      if (!args.url && !args.id) throw new NuvioError('Provide either url or id to identify the plugin.');
+      assertTarget('nuvio_update_plugin', args);
       const { profile_id, url, id, ...changes } = args;
       return plugins.updatePlugin(client, profile_id, { url, id }, changes, originId, ctx.apply);
     },
@@ -67,7 +59,7 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
     description: 'Set plugin order. Provide every installed plugin URL exactly once, in the desired order.',
     risk: 'write',
     resource,
-    schema: { profile_id: profile, ordered_urls: z.array(schemeTolerantUrl).min(1) },
+    schema: pluginReorderShape,
     handler: (args, ctx) =>
       plugins.reorderPlugins(client, args.profile_id, args.ordered_urls, originId, ctx.apply),
   });
@@ -78,9 +70,9 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
     description: 'Uninstall a plugin from a profile.',
     risk: 'destructive',
     resource,
-    schema: { profile_id: profile, url: schemeTolerantUrl.optional(), id: z.uuid().optional() },
+    schema: pluginRemoveShape,
     handler: (args, ctx) => {
-      if (!args.url && !args.id) throw new NuvioError('Provide either url or id to identify the plugin.');
+      assertTarget('nuvio_remove_plugin', args);
       return plugins.removePlugin(
         client,
         args.profile_id,

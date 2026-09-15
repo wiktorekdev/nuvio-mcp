@@ -6,13 +6,21 @@ import { deepMerge } from './settings.js';
 export const SETUP_PLATFORMS = ['tv', 'mobile', 'desktop'] as const;
 export type SetupPlatform = (typeof SETUP_PLATFORMS)[number];
 
+export interface CopyPlatformMapping {
+  from: SetupPlatform;
+  to: SetupPlatform;
+}
+
 export interface CopySetupInput {
   source_profile_id: number;
   target_profile_id: number;
-  platforms?: string[];
+  /** Platform mappings. Defaults to the identity mapping for every platform. */
+  platforms?: CopyPlatformMapping[];
   settings_mode?: 'merge' | 'replace';
   provider_credentials?: 'none' | 'merge' | 'replace';
 }
+
+const DEFAULT_MAPPINGS: CopyPlatformMapping[] = SETUP_PLATFORMS.map((p) => ({ from: p, to: p }));
 
 async function readPlatformSettings(
   client: NuvioClient,
@@ -45,8 +53,11 @@ export async function copySetup(
 ): Promise<ApplyResult<Record<string, unknown>>> {
   const source = input.source_profile_id;
   const target = input.target_profile_id;
-  if (source === target) throw new NuvioError('Source and target profile must differ.');
-  const platforms = input.platforms?.length ? input.platforms : [...SETUP_PLATFORMS];
+  if (source === target && !input.platforms?.some((m) => m.from !== m.to)) {
+    // Same profile and identity-only mappings is a genuine no-op.
+    return { applied: false, changed: false, before: {}, after: {}, diff: [] };
+  }
+  const mappings = input.platforms?.length ? input.platforms : DEFAULT_MAPPINGS;
   const mode = input.settings_mode ?? 'merge';
   const credMode = input.provider_credentials ?? 'none';
 
@@ -54,15 +65,28 @@ export async function copySetup(
   const after: Record<string, unknown> = { settings: {}, provider_credentials: [] };
   const diff: string[] = [];
 
-  for (const platform of platforms) {
-    const src = await readPlatformSettings(client, source, platform);
-    const tgt = await readPlatformSettings(client, target, platform);
-    (before.settings as Record<string, unknown>)[platform] = tgt;
+  // Read every source and target state BEFORE writing anything, so a chain like
+  // tv -> mobile, mobile -> desktop still uses the original mobile source state.
+  const sourceStates = new Map<string, Record<string, unknown> | null>();
+  const targetStates = new Map<string, Record<string, unknown> | null>();
+  for (const mapping of mappings) {
+    if (!sourceStates.has(mapping.from)) {
+      sourceStates.set(mapping.from, await readPlatformSettings(client, source, mapping.from));
+    }
+    if (!targetStates.has(mapping.to)) {
+      targetStates.set(mapping.to, await readPlatformSettings(client, target, mapping.to));
+    }
+  }
+
+  for (const mapping of mappings) {
+    const src = sourceStates.get(mapping.from) ?? null;
+    const tgt = targetStates.get(mapping.to) ?? null;
+    (before.settings as Record<string, unknown>)[mapping.to] = tgt;
     if (src === null) continue;
     const next = mode === 'replace' ? src : (deepMerge(tgt ?? {}, src) as Record<string, unknown>);
-    (after.settings as Record<string, unknown>)[platform] = next;
+    (after.settings as Record<string, unknown>)[mapping.to] = next;
     if (JSON.stringify(tgt) !== JSON.stringify(next)) {
-      diff.push(`~ ${platform} settings (${mode}) on profile ${target}`);
+      diff.push(`~ ${mapping.from} -> ${mapping.to} settings (${mode}) on profile ${target}`);
     }
   }
 
