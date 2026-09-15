@@ -321,7 +321,15 @@ export function defineMutation<S extends z.ZodRawShape>(
             before,
             read: (ref) => readResource(client, ref),
           };
-          const result = await spec.handler(typed, ctx);
+          let result: ApplyResult<unknown>;
+          try {
+            result = await spec.handler(typed, ctx);
+          } catch (error) {
+            // The write failed: drop the pre-change snapshot so a failed mutation
+            // never leaves a stale, non-revertible snapshot behind.
+            if (snapshot) removeSnapshot(cfg, snapshot.id);
+            throw error;
+          }
 
           if (snapshot && !(result.applied && result.changed)) removeSnapshot(cfg, snapshot.id);
 

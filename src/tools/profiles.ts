@@ -101,8 +101,10 @@ export function registerProfileTools(server: McpServer, client: NuvioClient, cfg
     name: 'nuvio_copy_setup',
     title: 'Copy setup between profiles',
     description:
-      'Copy a profile setup to another profile. Settings are deep-merged (settings_mode=merge) or replaced ' +
-      '(replace); provider credentials can be left alone, merged, or replaced. Replacement is called out in the diff.',
+      'Copy a profile setup to another profile, optionally across platforms (platforms: [{from,to}], defaults to ' +
+      'identity per platform). Settings are deep-merged (settings_mode=merge) or replaced (replace); provider ' +
+      'credentials can be left alone, merged, or replaced. Transactional: on failure it rolls back and reports ' +
+      'whether the rollback completed.',
     risk: 'write',
     resource: (args) => ({ kind: 'profile_setup', profile_id: args.target_profile_id }),
     schema: {
