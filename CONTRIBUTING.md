@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for taking the time to contribute. This is an unofficial community project and is not
-affiliated with or endorsed by Nuvio.
+Thanks for helping. This is an unofficial community project, not affiliated with or endorsed by
+Nuvio.
 
 ## Requirements
 
@@ -30,33 +30,30 @@ npm test
 bash test/docker-smoke.sh   # optional, needs Docker
 ```
 
-`npm test` builds the server and exercises it over stdio and HTTP against an in-memory mock backend
+`npm test` builds the server and runs it over stdio and HTTP against an in-memory mock backend
 (`test/mock-nuvio.mjs`), so no real Nuvio account is needed.
 
-## Adding or changing a tool
+## Tools
 
-- Register mutations with `defineMutation` / `defineLocalMutation` so they get `dry_run`, previews,
-  snapshots, audit and the per-call read cache automatically. Never hardcode `apply: true` in a
-  handler — use `ctx.apply`.
-- Read resources through `client.readRpc` / `client.select` (cached per call). A mutation must not
-  read the same resource twice.
-- Keep the canonical tool surface stable: `test/tools.test.mjs` asserts exactly **65 canonical
-  tools** and that none of the deprecated aliases appear in `nuvio_capabilities`. When a tool
-  changes shape, add a deprecated alias (`canonical: false, replacement: '...'`) instead of removing
-  it, and update that contract test with a comment explaining the change.
-- New behavior needs a regression test; prefer asserting backend request counts via `mock.stats()`
-  for pipeline guarantees.
+- Register mutations with `defineMutation` / `defineLocalMutation`; they handle dry runs, previews,
+  snapshots and audit. Never hardcode `apply: true` in a handler — use `ctx.apply`.
+- Read resources through `client.readRpc` / `client.select`.
+- Tool argument schemas live in `src/nuvio/schemas.ts`. `nuvio_apply_plan` validates operations with
+  the same schemas as the direct tools, so keep them in sync.
+- When a tool changes shape, keep the old name working as a deprecated alias (`canonical: false`,
+  `replacement: '...'`) instead of removing it.
+- New behavior needs a test.
 
 ## Project layout
 
 ```
 src/
-  index.ts            transport entrypoint
+  index.ts            entrypoint
   config.ts           environment configuration
   mcp.ts              server factory
-  server/http.ts      Streamable HTTP transport
+  server/http.ts      HTTP transport
   nuvio/              auth, client, snapshots, domain operations
-  tools/              MCP tool registration
+  tools/              tool registration
 test/                 unit, tool and HTTP tests + mock backend
 ```
 
@@ -64,9 +61,9 @@ test/                 unit, tool and HTTP tests + mock backend
 
 - Keep changes focused; one concern per pull request.
 - Add or update tests for behavior changes.
-- Update `README.md` or `SECURITY.md` when user-facing behavior or safety guarantees change.
+- Update `README.md` or `SECURITY.md` when user-facing behavior changes.
 - Do not commit secrets, tokens or `.env` files.
 
 ## Commit messages
 
-Use short, imperative subjects, optionally with a conventional prefix (`fix:`, `docs:`, `test:`).
+Short, imperative subjects, optionally with a prefix (`fix:`, `docs:`, `test:`).

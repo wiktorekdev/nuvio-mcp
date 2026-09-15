@@ -13,8 +13,8 @@ never calls Nuvio's `delete-account` edge function; account deletion is not impl
 ## Secrets in tool output
 
 Provider credentials, tracker tokens, PINs and passwords are masked in every tool result,
-`nuvio_inspect_snapshot`, and the audit log. Masking is key-based: raw secrets never appear in MCP
-outputs or audit entries. In addition to the pattern-matched keys, the exact keys `pin`,
+`nuvio_inspect_snapshot`, and the audit log. Masking is key-based: values under recognised secret
+keys are replaced before output. In addition to the pattern-matched keys, the exact keys `pin`,
 `current_pin`, `new_pin`, `old_pin`, `pincode` and `passcode` are always masked, while unrelated
 fields such as `pinToTop` and `pin_enabled` are preserved. Sensitive snapshots do intentionally store
 the previous raw values locally so credential and tracker changes can be undone to the exact prior
@@ -67,9 +67,10 @@ Applied to `nuvio_delete_profile`, `nuvio_restore_backup`, `nuvio_revoke_session
 ## Snapshot integrity
 
 A reversible mutation only runs after its pre-change snapshot is durably written (temp file, fsync,
-atomic rename, mode `0600`). If the snapshot cannot be persisted the mutation is refused. Restore is
-scope-precise: it deletes only the identities the mutation touched and never removes unrelated items,
-even when the backend paginates. Snapshot ids are validated before touching the filesystem, so a
+atomic rename, mode `0600`). If the snapshot cannot be persisted the mutation is refused. When a
+snapshot records the identities a change touched, restore only affects those identities and leaves
+unrelated items alone. Snapshots from older versions that predate this do not carry that information
+and are restored as a full resource. Snapshot ids are validated before touching the filesystem, so a
 crafted id cannot read or delete files outside the snapshot directory.
 
 ## Remote HTTP
@@ -91,12 +92,15 @@ crafted id cannot read or delete files outside the snapshot directory.
 ## Threat-model notes
 
 - Concurrent mutations to the same profile are last-writer-wins, which is inherent to Nuvio's
-  full-replace write API. Settings writes use the backend's guarded RPC and are rejected on conflict.
+  full-replace write API. Only profile settings use a guarded write and are rejected on conflict;
+  other resources have no such protection. After a failed batch write, `nuvio_apply_plan` will not
+  roll back a resource that changed after the plan wrote it.
 - `nuvio_inspect_addon` fetches a caller-supplied manifest URL. Only `http(s)` and publicly routable
   hosts are allowed: loopback, private, link-local and multicast addresses are refused, every DNS
   answer and every redirect hop is re-checked, and the request has a timeout and a response-size cap.
 - Outbound requests to the Nuvio backend and authorization endpoints have a timeout, so a slow or
   malicious endpoint cannot hang a tool call.
-- Writes are never retried automatically, since Nuvio's sync endpoints are not idempotent.
+- Reads are retried on transient failures; writes are not retried automatically unless the operation
+  is explicitly idempotent, since Nuvio's sync endpoints do not deduplicate.
 - Anyone with read access to `NUVIO_DATA_DIR` can read the refresh token and any raw secrets held in
   snapshots. Protect the directory (and the Docker volume) accordingly.
