@@ -17,12 +17,17 @@ export interface RequestOptions {
    */
   cache?: boolean;
   /**
-   * Marks the request as safe to retry after transient failures. Reads are
-   * idempotent by default (GET/HEAD); a POST RPC must opt in. Non-idempotent
-   * writes are never retried automatically.
+   * Marks the request as intrinsically safe to repeat. This — and only this —
+   * decides whether a failed write may be retried. Reads are idempotent by
+   * default (GET/HEAD); a POST RPC must opt in. Non-idempotent writes are never
+   * retried automatically.
    */
   idempotent?: boolean;
-  /** Correlation id echoed on retried writes via the Idempotency-Key header. */
+  /**
+   * Optional correlation header (Idempotency-Key) for observability. The hosted
+   * backend does NOT implement deduplication, so this header is informational
+   * only and must never be treated as a retry guarantee.
+   */
   requestId?: string;
 }
 
@@ -86,6 +91,8 @@ export class NuvioClient {
 
   private async sendWithRetry(path: string, options: RequestOptions, token: string): Promise<Response> {
     const method = options.method ?? 'GET';
+    // Retry is driven purely by the operation's intrinsic idempotency. An
+    // Idempotency-Key is never sufficient on its own: the backend does not dedupe.
     const idempotent = options.idempotent ?? method === 'GET';
     let attempt = 0;
     for (;;) {

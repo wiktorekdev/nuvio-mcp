@@ -276,6 +276,20 @@ test('401 triggers a single refresh and retry', async () => {
   }
 });
 
+test('an Idempotency-Key alone does not make a write retryable', async () => {
+  let calls = 0;
+  const { client, restore } = makeClient(async () => {
+    calls += 1;
+    return new Response('x', { status: 503 });
+  });
+  try {
+    await assert.rejects(() => client.rpc('sync_push_addons', { a: 1 }, { requestId: 'req-x' }));
+    assert.equal(calls, 1, 'requestId is informational; retry requires intrinsic idempotency');
+  } finally {
+    restore();
+  }
+});
+
 test('idempotency metadata is sent as the Idempotency-Key header', async () => {
   let seen = null;
   const { client, restore } = makeClient(async (_url, init) => {

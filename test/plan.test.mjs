@@ -324,6 +324,22 @@ test('library and progress upserts are idempotent', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Backup scoping
+// ---------------------------------------------------------------------------
+
+test('a full backup is returned unwrapped', async () => {
+  const out = parse(await mcp.call('nuvio_export_backup', {}));
+  assert.equal(out.version, 1);
+});
+
+test('a scoped backup that cannot be confirmed warns instead of pretending to be scoped', async () => {
+  const out = parse(await mcp.call('nuvio_export_backup', { scope: ['settings'], profile_ids: [1] }));
+  assert.equal(out.scope_verified, false);
+  assert.match(out.warning, /FULL backup|did not confirm/);
+  assert.ok(out.backup, 'the raw backup is still returned for inspection');
+});
+
+// ---------------------------------------------------------------------------
 // API contract
 // ---------------------------------------------------------------------------
 

@@ -165,8 +165,17 @@ Apply many canonical operations as one transaction:
 - Reads (GET, and read RPCs) retry network errors and `408/429/500/502/503/504` with exponential
   backoff and `Retry-After`.
 - Non-idempotent writes are **never** retried automatically — a lost response must not silently
-  double-apply a mutation. Opt in per request with an idempotency key when a write is safe to repeat.
+  double-apply a mutation. Retry only happens for operations that are **intrinsically** idempotent.
+- An `Idempotency-Key` is informational only: the hosted backend does not deduplicate, so a key
+  never makes a write retryable by itself.
 - A `401` triggers one transparent token refresh, then one retry.
+
+### Backup scope
+
+`nuvio_export_backup` with no scope returns a full backup. When you pass `scope`, `profile_ids` or
+`platforms`, the backend must confirm the narrowing; the result then includes `scope_verified` and,
+if scoping cannot be confirmed, an explicit `warning`. There is **no silent fallback** that treats a
+full backup as scoped.
 
 ## Safety
 
