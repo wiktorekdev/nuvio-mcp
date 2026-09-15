@@ -13,8 +13,22 @@ export async function listAvatars(client: NuvioClient): Promise<unknown[]> {
   return client.readRpc('get_avatar_catalog', {});
 }
 
-export async function exportBackup(client: NuvioClient): Promise<unknown> {
-  return client.rpc('sync_export_account_backup', {});
+export interface BackupScope {
+  scope?: string[];
+  profile_ids?: number[];
+  platforms?: string[];
+}
+
+/**
+ * Export an account backup. With no scope this is a full backup; passing scope
+ * entries, profile ids or platforms narrows what the backend exports.
+ */
+export async function exportBackup(client: NuvioClient, options: BackupScope = {}): Promise<unknown> {
+  const args: Record<string, unknown> = {};
+  if (options.scope?.length) args.p_scope = options.scope;
+  if (options.profile_ids?.length) args.p_profile_ids = options.profile_ids;
+  if (options.platforms?.length) args.p_platforms = options.platforms;
+  return client.rpc('sync_export_account_backup', args);
 }
 
 export async function health(client: NuvioClient): Promise<unknown> {

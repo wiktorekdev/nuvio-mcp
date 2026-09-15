@@ -70,13 +70,17 @@ node dist/index.js
 
 ## Configuration
 
-| Variable              | Description                        |
-| --------------------- | ---------------------------------- |
-| `NUVIO_EMAIL`         | Nuvio account email                |
-| `NUVIO_PASSWORD`      | Nuvio account password             |
-| `NUVIO_REFRESH_TOKEN` | Alternative to email/password      |
-| `NUVIO_TRANSPORT`     | `stdio` (default) or `http`        |
-| `NUVIO_HTTP_TOKEN`    | Bearer token for the HTTP endpoint |
+| Variable                         | Description                         |
+| -------------------------------- | ----------------------------------- |
+| `NUVIO_EMAIL`                    | Nuvio account email                 |
+| `NUVIO_PASSWORD`                 | Nuvio account password              |
+| `NUVIO_REFRESH_TOKEN`            | Alternative to email/password       |
+| `NUVIO_BACKEND_TIMEOUT_MS`       | Backend request timeout (ms)        |
+| `NUVIO_TRANSPORT`                | `stdio` (default) or `http`         |
+| `NUVIO_HTTP_TOKEN`               | Bearer token for the HTTP endpoint  |
+| `NUVIO_SNAPSHOT_MAX_AGE_DAYS`    | Snapshot retention: max age (days)  |
+| `NUVIO_SNAPSHOT_MAX_COUNT`       | Snapshot retention: max count       |
+| `NUVIO_SNAPSHOT_MAX_TOTAL_BYTES` | Snapshot retention: max total bytes |
 
 See [`.env.example`](.env.example) for all options.
 
@@ -107,16 +111,84 @@ docker run --rm -p 3333:3333 \
   nuvio-mcp
 ```
 
+## Tools: canonical vs deprecated
+
+`nuvio_capabilities` returns the **canonical** tool list (65 tools) plus a separate
+`deprecated_tools` list. Deprecated aliases stay callable for compatibility but are hidden from
+capabilities and marked `[DEPRECATED]` with their replacement in the tool description.
+
+| Deprecated alias                                   | Canonical replacement                     |
+| -------------------------------------------------- | ----------------------------------------- |
+| `nuvio_set_setting` / `nuvio_unset_setting`        | `nuvio_update_settings` (`set` / `unset`) |
+| `nuvio_set_home_catalog_path`                      | `nuvio_update_home_catalog_settings`      |
+| `nuvio_toggle_addon`                               | `nuvio_update_addon`                      |
+| `nuvio_toggle_plugin`                              | `nuvio_update_plugin`                     |
+| `nuvio_copy_settings` / `nuvio_copy_profile_setup` | `nuvio_copy_setup`                        |
+| `nuvio_mark_watched`                               | `nuvio_add_to_watch_history`              |
+
+## dry_run
+
+Every mutation accepts `dry_run: true`: it validates, reads and computes the exact diff, but
+**writes nothing, creates no snapshot and writes no audit entry**.
+
+`nuvio_update_settings` takes `patch` (deep-merged), `set` (nested dot paths) and `unset` (delete
+paths), applied in that order. Arrays and scalars replace; nested objects merge; `null` is a value;
+deletion happens only via `unset`.
+
+## nuvio_apply_plan
+
+Apply many canonical operations as one transaction:
+
+1. validates every operation up front and rejects the whole plan if any is invalid, unsupported or
+   irreversible — before any write;
+2. reads each affected resource **once**, computes all changes in memory, then writes each resource
+   **once**;
+3. takes a single **composite snapshot** that can be reverted with `nuvio_undo`;
+4. on failure, rolls back and reports an explicit status: `preview`, `applied`, `rolled_back`,
+   `partially_applied` or `failed_before_apply` (with per-operation and per-resource diffs).
+
+```jsonc
+{
+  "operations": [
+    {
+      "tool": "nuvio_update_settings",
+      "args": { "profile_id": 1, "platform": "tv", "set": [{ "path": "features.x", "value": 1 }] },
+    },
+    { "tool": "nuvio_add_addon", "args": { "profile_id": 1, "url": "https://example.com/manifest.json" } },
+  ],
+  "dry_run": true,
+}
+```
+
+## Retry safety
+
+- Reads (GET, and read RPCs) retry network errors and `408/429/500/502/503/504` with exponential
+  backoff and `Retry-After`.
+- Non-idempotent writes are **never** retried automatically — a lost response must not silently
+  double-apply a mutation. Opt in per request with an idempotency key when a write is safe to repeat.
+- A `401` triggers one transparent token refresh, then one retry.
+
 ## Safety
 
 - Reversible mutations create a snapshot before they run
-- Undo and redo via `nuvio_undo` and `nuvio_redo`
+- Undo and redo via `nuvio_undo` and `nuvio_redo` (single and composite snapshots)
 - Irreversible operations use two-step confirmation
 - Secrets are masked from MCP outputs
 - Sensitive snapshots may contain raw credentials locally, for exact undo
 
 Set `NUVIO_DISABLE_SNAPSHOTS=true` to never write snapshots locally: reversible changes then run
 without snapshots and cannot be undone, and no raw credentials are stored on disk.
+
+### Snapshot retention
+
+Snapshots are garbage-collected automatically after every write, and on demand via
+`nuvio_prune_snapshots` (defaults to `dry_run`; pass `confirm: true` to delete). Limits:
+
+| Variable                         | Default    | Meaning                                         |
+| -------------------------------- | ---------- | ----------------------------------------------- |
+| `NUVIO_SNAPSHOT_MAX_AGE_DAYS`    | `30`       | Remove snapshots older than this (`0` disables) |
+| `NUVIO_SNAPSHOT_MAX_COUNT`       | `250`      | Keep at most this many snapshots                |
+| `NUVIO_SNAPSHOT_MAX_TOTAL_BYTES` | `52428800` | Keep the directory under ~50 MB                 |
 
 See [SECURITY.md](SECURITY.md) for the security model.
 
