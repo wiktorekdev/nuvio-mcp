@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 /**
  * Two-phase confirmation for operations a snapshot cannot truly reverse
@@ -6,12 +6,16 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
  *
  * `prepare` returns a short-lived token bound to the exact tool name and arguments.
  * `execute` verifies the token (signature, tool, arguments, expiry, single use).
+ *
+ * The arguments are committed to the token as a SHA-256 hash, never in the clear:
+ * confirmation tokens are returned to the caller, so embedding raw arguments would
+ * leak secrets (e.g. a profile PIN) and could inflate the token with large backups.
  */
 const TTL_MS = 5 * 60 * 1000;
 
 interface TokenPayload {
   tool: string;
-  args: string;
+  argsHash: string;
   exp: number;
   nonce: string;
 }
@@ -47,11 +51,15 @@ export class ConfirmationGate {
     return JSON.stringify(relevant);
   }
 
+  private hashArgs(args: Record<string, unknown>): string {
+    return createHash('sha256').update(ConfirmationGate.fingerprint(args)).digest('hex');
+  }
+
   prepare(tool: string, args: Record<string, unknown>): { token: string; expires_at: string } {
     this.prune();
     const payload: TokenPayload = {
       tool,
-      args: ConfirmationGate.fingerprint(args),
+      argsHash: this.hashArgs(args),
       exp: Date.now() + TTL_MS,
       nonce: randomBytes(9).toString('base64url'),
     };
@@ -81,7 +89,7 @@ export class ConfirmationGate {
     }
     if (payload.tool !== tool)
       throw new ConfirmationError('Confirmation token was issued for a different operation.');
-    if (payload.args !== ConfirmationGate.fingerprint(args)) {
+    if (payload.argsHash !== this.hashArgs(args)) {
       throw new ConfirmationError('Confirmation token does not match these arguments.');
     }
     if (payload.exp <= Date.now())

@@ -9,7 +9,8 @@ import {
   closeSync,
   fsyncSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { join, resolve, sep } from 'node:path';
 import type { NuvioConfig } from '../config.js';
 import type { NuvioClient } from './client.js';
 import { NuvioError } from './errors.js';
@@ -57,10 +58,21 @@ export interface Snapshot {
   before: unknown;
 }
 
+const SNAPSHOT_ID_RE = /^\d{16}-[a-z0-9]{4,16}$/;
+
 function snapshotId(): string {
   const ms = String(Date.now()).padStart(16, '0');
-  const rand = Math.random().toString(36).slice(2, 8);
+  const rand = randomBytes(4).toString('hex');
   return `${ms}-${rand}`;
+}
+
+/** Resolve a snapshot file path, refusing ids that could escape the snapshot directory. */
+function snapshotFile(cfg: NuvioConfig, id: string): string | null {
+  if (!SNAPSHOT_ID_RE.test(id)) return null;
+  const dir = resolve(cfg.snapshotDir);
+  const target = resolve(join(cfg.snapshotDir, `${id}.json`));
+  if (!target.startsWith(dir + sep)) return null;
+  return target;
 }
 
 function sensitiveKind(kind: ResourceRef['kind']): boolean {
@@ -124,8 +136,10 @@ function persist(cfg: NuvioConfig, snapshot: Snapshot): void {
 }
 
 export function removeSnapshot(cfg: NuvioConfig, id: string): void {
+  const target = snapshotFile(cfg, id);
+  if (!target) return;
   try {
-    unlinkSync(join(cfg.snapshotDir, `${id}.json`));
+    unlinkSync(target);
   } catch {
     /* already gone */
   }
@@ -151,8 +165,10 @@ export function listSnapshots(cfg: NuvioConfig, limit = 25): Snapshot[] {
 }
 
 export function getSnapshot(cfg: NuvioConfig, id: string): Snapshot | null {
+  const target = snapshotFile(cfg, id);
+  if (!target) return null;
   try {
-    return JSON.parse(readFileSync(join(cfg.snapshotDir, `${id}.json`), 'utf8')) as Snapshot;
+    return JSON.parse(readFileSync(target, 'utf8')) as Snapshot;
   } catch {
     return null;
   }

@@ -78,16 +78,21 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
           `Snapshot ${target.id} (${target.tool}) is not reversible${target.note ? ` — ${target.note}` : ''}.`
         );
       }
-      const current = await readResource(client, target.resource);
-      capture(cfg, client, {
-        tool: 'nuvio_undo',
-        resource: target.resource,
-        before: current,
-        reversible: true,
-        note: `state before undoing ${target.id}`,
-      });
+      if (!cfg.disableSnapshots) {
+        const current = await readResource(client, target.resource);
+        capture(cfg, client, {
+          tool: 'nuvio_undo',
+          resource: target.resource,
+          before: current,
+          reversible: true,
+          note: `state before undoing ${target.id}`,
+        });
+      }
       const message = await restore(client, cfg, target);
-      return `${message} Reverted snapshot ${target.id} (${target.tool}).`;
+      const suffix = cfg.disableSnapshots
+        ? ' Snapshots are disabled, so this undo cannot itself be undone.'
+        : '';
+      return `${message} Reverted snapshot ${target.id} (${target.tool}).${suffix}`;
     },
   });
 
@@ -102,16 +107,19 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
     handler: async () => {
       const target = findLastUndo(cfg);
       if (!target) throw new NuvioError('There is nothing to redo.');
-      const current = await readResource(client, target.resource);
-      capture(cfg, client, {
-        tool: 'nuvio_redo',
-        resource: target.resource,
-        before: current,
-        reversible: true,
-        note: `state before redoing ${target.id}`,
-      });
+      if (!cfg.disableSnapshots) {
+        const current = await readResource(client, target.resource);
+        capture(cfg, client, {
+          tool: 'nuvio_redo',
+          resource: target.resource,
+          before: current,
+          reversible: true,
+          note: `state before redoing ${target.id}`,
+        });
+      }
       const message = await restore(client, cfg, target);
-      return `${message} Re-applied snapshot ${target.id}.`;
+      const suffix = cfg.disableSnapshots ? ' Snapshot writing is disabled; this redo was not recorded.' : '';
+      return `${message} Re-applied snapshot ${target.id}.${suffix}`;
     },
   });
 }

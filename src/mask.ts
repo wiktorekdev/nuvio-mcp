@@ -1,8 +1,13 @@
 const SECRET_KEY = /(password|passwd|secret|token|api[_-]?key|credential|authorization)/i;
+/** Exact keys that are secret but not matched by SECRET_KEY (e.g. PIN). */
+const SECRET_KEYS = new Set(['pin', 'current_pin', 'new_pin', 'old_pin', 'pincode', 'passcode']);
 const NOT_SECRET = new Set(['origin_client_id']);
 
 function shouldMask(key: string): boolean {
-  return !NOT_SECRET.has(key) && SECRET_KEY.test(key);
+  const lower = key.toLowerCase();
+  if (NOT_SECRET.has(lower)) return false;
+  if (SECRET_KEYS.has(lower)) return true;
+  return SECRET_KEY.test(lower);
 }
 
 /** Mask a single secret, keeping a short suffix so operators can still tell values apart. */
