@@ -62,6 +62,7 @@ test/                 unit, tool and HTTP tests + mock backend
 - Keep changes focused; one concern per pull request.
 - Add or update tests for behavior changes.
 - Update `README.md` or `SECURITY.md` when user-facing behavior changes.
+- Add a `CHANGELOG.md` entry for user-visible changes.
 - Do not commit secrets, tokens or `.env` files.
 
 ## Commit messages
