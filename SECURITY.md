@@ -14,8 +14,11 @@ never calls Nuvio's `delete-account` edge function; account deletion is not impl
 
 Provider credentials, tracker tokens, PINs and passwords are masked in every tool result,
 `nuvio_inspect_snapshot`, and the audit log. Masking is key-based: raw secrets never appear in MCP
-outputs or audit entries. Sensitive snapshots do intentionally store the previous raw values locally
-so credential and tracker changes can be undone to the exact prior value (see below).
+outputs or audit entries. In addition to the pattern-matched keys, the exact keys `pin`,
+`current_pin`, `new_pin`, `old_pin`, `pincode` and `passcode` are always masked, while unrelated
+fields such as `pinToTop` and `pin_enabled` are preserved. Sensitive snapshots do intentionally store
+the previous raw values locally so credential and tracker changes can be undone to the exact prior
+value (see below).
 
 ## Data at rest
 
@@ -27,6 +30,11 @@ Everything is written under `NUVIO_DATA_DIR` (default `~/.local/share/nuvio-mcp`
 | `snapshots/`       | `0700` | Pre-change snapshots                              |
 | `snapshots/*.json` | `0600` | Captured state (see below)                        |
 | `audit.jsonl`      | `0600` | Applied mutations with masked arguments and diffs |
+
+The audit log is rotated to `audit.jsonl.1` once it exceeds 5 MB.
+
+`.env` files are only read from the package installation directory, never from the current working
+directory: running the server inside an untrusted directory cannot repoint the backend or data paths.
 
 **Sensitive snapshots contain raw secrets.** To make credential and tracker changes exactly
 reversible, snapshots for `provider_credentials`, `tracker_tokens` and `profile_setup` store the
@@ -41,15 +49,18 @@ that issued them.
 
 Set `NUVIO_DISABLE_SNAPSHOTS=true` to never write snapshots to disk. Reversible changes then run
 without undo and no raw credentials are stored locally, but the server can no longer revert them.
+`nuvio_undo` and `nuvio_redo` honour the same flag and also stop writing snapshots.
 
 ## Confirmation tokens
 
 Operations a snapshot cannot reverse use a prepare/execute flow. The first call returns a token that
-is an HMAC over the tool name, a canonical fingerprint of the arguments, an expiry (5 minutes) and a
-random nonce. The second call must present the same tool and arguments; tokens are single-use
-(consumed in memory until expiry) and rejected if the arguments or tool differ. Replay protection is
-in-process: restarting the server clears the consumed-nonce set, so within the token's 5-minute TTL a
-restart can allow a replay. Set `NUVIO_CONFIRM_SECRET` and treat the server process as trusted.
+is an HMAC over the tool name, a SHA-256 hash of a canonical fingerprint of the arguments, an expiry
+(5 minutes) and a random nonce. The raw arguments are never embedded in the token, so secrets (for
+example a profile PIN) and large backups cannot be read out of it. The second call must present the
+same tool and arguments; tokens are single-use (consumed in memory until expiry) and rejected if the
+arguments or tool differ. Replay protection is in-process: restarting the server clears the
+consumed-nonce set, so within the token's 5-minute TTL a restart can allow a replay. Set
+`NUVIO_CONFIRM_SECRET` and treat the server process as trusted.
 Applied to `nuvio_delete_profile`, `nuvio_restore_backup`, `nuvio_revoke_session`,
 `nuvio_set_profile_pin`, `nuvio_clear_profile_pin` and `nuvio_register_device`.
 
@@ -58,7 +69,8 @@ Applied to `nuvio_delete_profile`, `nuvio_restore_backup`, `nuvio_revoke_session
 A reversible mutation only runs after its pre-change snapshot is durably written (temp file, fsync,
 atomic rename, mode `0600`). If the snapshot cannot be persisted the mutation is refused. Restore is
 scope-precise: it deletes only the identities the mutation touched and never removes unrelated items,
-even when the backend paginates.
+even when the backend paginates. Snapshot ids are validated before touching the filesystem, so a
+crafted id cannot read or delete files outside the snapshot directory.
 
 ## Remote HTTP
 
@@ -80,6 +92,11 @@ even when the backend paginates.
 
 - Concurrent mutations to the same profile are last-writer-wins, which is inherent to Nuvio's
   full-replace write API. Settings writes use the backend's guarded RPC and are rejected on conflict.
+- `nuvio_inspect_addon` fetches a caller-supplied manifest URL. Only `http(s)` and publicly routable
+  hosts are allowed: loopback, private, link-local and multicast addresses are refused, every DNS
+  answer and every redirect hop is re-checked, and the request has a timeout and a response-size cap.
+- Outbound requests to the Nuvio backend and authorization endpoints have a timeout, so a slow or
+  malicious endpoint cannot hang a tool call.
 - Writes are never retried automatically, since Nuvio's sync endpoints are not idempotent.
 - Anyone with read access to `NUVIO_DATA_DIR` can read the refresh token and any raw secrets held in
   snapshots. Protect the directory (and the Docker volume) accordingly.
