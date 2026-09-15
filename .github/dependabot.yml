@@ -1,11 +1,33 @@
 version: 2
+# Low-noise setup: minor/patch updates arrive grouped, once a month.
+# Major bumps are ignored on purpose (they need a human: e.g. typescript 7 conflicts
+# with typescript-eslint, @types/node must match the supported Node range).
 updates:
   - package-ecosystem: npm
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: '*'
+        update-types:
+          - version-update:semver-major
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      # Action releases are effectively major-only (v4 -> v7), so grouping them is
+      # what keeps the noise down; they are reviewed once a month.
+      actions-all:
+        patterns:
+          - '*'
