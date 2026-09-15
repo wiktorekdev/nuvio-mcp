@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
 import { defineMutation, defineRead } from './helpers.js';
+import { schemeTolerantUrl } from './url.js';
 import * as plugins from '../nuvio/ops/plugins.js';
 
 export function registerPluginTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
@@ -42,7 +43,7 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
     description: 'Turn one plugin on or off for a profile.',
     risk: 'write',
     resource,
-    schema: { profile_id: profile, url: z.url(), enabled: z.boolean() },
+    schema: { profile_id: profile, url: schemeTolerantUrl, enabled: z.boolean() },
     handler: (args) => plugins.togglePlugin(client, args.profile_id, args.url, args.enabled, originId, true),
   });
 
@@ -52,7 +53,7 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
     description: 'Set plugin order. Provide every installed plugin URL exactly once, in the desired order.',
     risk: 'write',
     resource,
-    schema: { profile_id: profile, ordered_urls: z.array(z.url()).min(1) },
+    schema: { profile_id: profile, ordered_urls: z.array(schemeTolerantUrl).min(1) },
     handler: (args) => plugins.reorderPlugins(client, args.profile_id, args.ordered_urls, originId, true),
   });
 
@@ -62,7 +63,7 @@ export function registerPluginTools(server: McpServer, client: NuvioClient, cfg:
     description: 'Uninstall a plugin from a profile.',
     risk: 'destructive',
     resource,
-    schema: { profile_id: profile, url: z.url() },
+    schema: { profile_id: profile, url: schemeTolerantUrl },
     handler: (args, ctx) => plugins.removePlugin(client, args.profile_id, args.url, originId, ctx.apply),
   });
 }

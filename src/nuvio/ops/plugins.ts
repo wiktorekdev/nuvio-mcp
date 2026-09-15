@@ -18,6 +18,18 @@ export interface PluginInput {
   repo_type?: string | null;
 }
 
+function assertHttpUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new NuvioError(`Invalid plugin URL: ${url}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new NuvioError(`Plugin URL must be http(s): ${url}`);
+  }
+}
+
 export async function listPlugins(client: NuvioClient, profileId: number): Promise<Plugin[]> {
   return client.select<Plugin[]>(
     'plugins',
@@ -81,6 +93,7 @@ export async function addPlugin(
   originId: string,
   apply: boolean
 ): Promise<ApplyResult<PluginPush[]>> {
+  assertHttpUrl(input.url);
   const before = toPushShape(await listPlugins(client, profileId));
   if (before.some((p) => p.url === input.url)) throw new NuvioError(`Plugin already installed: ${input.url}`);
   const after = [
