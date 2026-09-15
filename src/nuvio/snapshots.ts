@@ -8,6 +8,7 @@ import {
   openSync,
   closeSync,
   fsyncSync,
+  statSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join, resolve, sep } from 'node:path';
@@ -43,19 +44,36 @@ export type ResourceRef =
   | { kind: 'profile_setup'; profile_id: number }
   | { kind: 'sessions' };
 
+export interface SnapshotResourceEntry {
+  resource: ResourceRef;
+  before: unknown;
+}
+
 export interface Snapshot {
   id: string;
   ts: string;
   tool: string;
   backend: string;
   account?: string;
-  resource: ResourceRef;
+  /** Set for single-resource snapshots; omitted for composite ones. */
+  resource?: ResourceRef;
   reversible: boolean;
   sensitive: boolean;
   note?: string;
   /** Identities the mutation touched, used for precise, truncation-safe undo. */
   scope?: unknown;
-  before: unknown;
+  /** Set for single-resource snapshots; omitted for composite ones. */
+  before?: unknown;
+  /** Set for composite snapshots (e.g. nuvio_apply_plan) covering several resources. */
+  resources?: SnapshotResourceEntry[];
+  composite?: boolean;
+}
+
+/** Normalise a snapshot to its resource entries, regardless of single/composite shape. */
+export function snapshotResources(s: Snapshot): SnapshotResourceEntry[] {
+  if (s.resources && s.resources.length > 0) return s.resources;
+  if (s.resource) return [{ resource: s.resource, before: s.before }];
+  return [];
 }
 
 const SNAPSHOT_ID_RE = /^\d{16}-[a-z0-9]{4,16}$/;
@@ -108,6 +126,35 @@ export function capture(
   return snapshot;
 }
 
+/** Capture one snapshot covering several resources (used by nuvio_apply_plan). */
+export function captureComposite(
+  cfg: NuvioConfig,
+  client: NuvioClient,
+  input: {
+    tool: string;
+    entries: SnapshotResourceEntry[];
+    reversible?: boolean;
+    note?: string;
+    scope?: unknown;
+  }
+): Snapshot {
+  const snapshot: Snapshot = {
+    id: snapshotId(),
+    ts: new Date().toISOString(),
+    tool: input.tool,
+    backend: cfg.backendUrl,
+    account: client.currentEmail ?? client.currentUserId,
+    reversible: input.reversible ?? true,
+    sensitive: input.entries.some((e) => sensitiveKind(e.resource.kind)),
+    note: input.note,
+    scope: input.scope,
+    resources: input.entries,
+    composite: true,
+  };
+  persist(cfg, snapshot);
+  return snapshot;
+}
+
 /** Atomically write a snapshot (temp file + fsync + rename, 0600). Throws on any failure. */
 function persist(cfg: NuvioConfig, snapshot: Snapshot): void {
   const target = join(cfg.snapshotDir, `${snapshot.id}.json`);
@@ -133,6 +180,84 @@ function persist(cfg: NuvioConfig, snapshot: Snapshot): void {
         'The change was not applied.'
     );
   }
+  // Best-effort retention: never let a runaway snapshot directory grow unbounded.
+  try {
+    pruneSnapshots(cfg, {});
+  } catch {
+    /* retention is best-effort */
+  }
+}
+
+export interface PruneOptions {
+  olderThanDays?: number;
+  /** Newest N snapshots are never removed. Defaults to the configured max count. */
+  keepLast?: number;
+  /** Hard count limit; snapshots beyond it are removed (automatic GC). */
+  maxCount?: number;
+  maxTotalBytes?: number;
+  dryRun?: boolean;
+}
+
+export interface PruneResult {
+  removed: Array<{ id: string; bytes: number; reason: string }>;
+  kept: number;
+  freed_bytes: number;
+}
+
+/** Delete old/large snapshots according to the retention limits. */
+export function pruneSnapshots(cfg: NuvioConfig, options: PruneOptions = {}): PruneResult {
+  const olderThanDays = options.olderThanDays ?? cfg.snapshotMaxAgeDays;
+  const keepLast = options.keepLast ?? cfg.snapshotMaxCount;
+  const maxCount = options.maxCount ?? cfg.snapshotMaxCount;
+  const maxTotalBytes = options.maxTotalBytes ?? cfg.snapshotMaxTotalBytes;
+
+  let files: string[];
+  try {
+    files = readdirSync(cfg.snapshotDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return { removed: [], kept: 0, freed_bytes: 0 };
+  }
+  const entries = files
+    .map((file) => {
+      const id = file.slice(0, -'.json'.length);
+      let size = 0;
+      try {
+        size = statSync(join(cfg.snapshotDir, file)).size;
+      } catch {
+        /* unreadable, treat as empty */
+      }
+      return { id, size };
+    })
+    .sort((a, b) => (a.id < b.id ? 1 : -1)); // newest first
+
+  const cutoff = olderThanDays > 0 ? Date.now() - olderThanDays * 24 * 60 * 60 * 1000 : 0;
+  const removed: PruneResult['removed'] = [];
+  let cumulative = 0;
+  entries.forEach((entry, index) => {
+    // The newest `keepLast` snapshots are always retained (that is the count limit).
+    if (index < keepLast) {
+      cumulative += entry.size;
+      return;
+    }
+    const ts = Number(entry.id.slice(0, 16));
+    const tooOld = cutoff > 0 && Number.isFinite(ts) && ts < cutoff;
+    const tooBig = maxTotalBytes > 0 && cumulative + entry.size > maxTotalBytes;
+    const tooMany = maxCount > 0 && index >= maxCount;
+    if (tooOld || tooBig || tooMany) {
+      removed.push({ id: entry.id, bytes: entry.size, reason: tooOld ? 'age' : tooBig ? 'size' : 'count' });
+    } else {
+      cumulative += entry.size;
+    }
+  });
+
+  if (!options.dryRun) {
+    for (const entry of removed) removeSnapshot(cfg, entry.id);
+  }
+  return {
+    removed,
+    kept: entries.length - removed.length,
+    freed_bytes: removed.reduce((sum, r) => sum + r.bytes, 0),
+  };
 }
 
 export function removeSnapshot(cfg: NuvioConfig, id: string): void {
@@ -220,11 +345,15 @@ const PROGRESS_FIELDS = [
 ];
 const HISTORY_FIELDS = ['content_id', 'content_type', 'title', 'season', 'episode', 'watched_at'];
 
-/** Read the current state of a resource in the shape `restore` expects. */
+/**
+ * Read the current state of a resource in the shape `restore` expects. Uses the
+ * cached read RPCs so that, within one MCP call, the snapshot read and the ops
+ * read collapse into a single backend request.
+ */
 export async function readResource(client: NuvioClient, ref: ResourceRef): Promise<unknown> {
   switch (ref.kind) {
     case 'profiles': {
-      const rows = await client.rpc<Array<Record<string, unknown>>>('sync_pull_profiles', {});
+      const rows = await client.readRpc<Array<Record<string, unknown>>>('sync_pull_profiles', {});
       return strip(rows, [
         'profile_index',
         'name',
@@ -235,28 +364,34 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
         'avatar_url',
       ]);
     }
-    case 'addons':
-      return client.select(
+    case 'addons': {
+      const rows = await client.select<Array<Record<string, unknown>>>(
         'addons',
-        `select=url,name,enabled,sort_order&profile_id=eq.${ref.profile_id}&order=sort_order.asc`
+        `select=id,user_id,profile_id,url,name,enabled,sort_order,created_at,updated_at` +
+          `&profile_id=eq.${ref.profile_id}&order=sort_order.asc,created_at.asc`
       );
-    case 'plugins':
-      return client.select(
+      return strip(rows, ['url', 'name', 'enabled', 'sort_order']);
+    }
+    case 'plugins': {
+      const rows = await client.select<Array<Record<string, unknown>>>(
         'plugins',
-        `select=url,name,enabled,sort_order,repo_type&profile_id=eq.${ref.profile_id}&order=sort_order.asc`
+        `select=id,user_id,profile_id,url,name,enabled,sort_order,repo_type,created_at,updated_at` +
+          `&profile_id=eq.${ref.profile_id}&order=sort_order.asc`
       );
+      return strip(rows, ['url', 'name', 'enabled', 'sort_order', 'repo_type']);
+    }
     case 'settings':
     case 'home_catalog_settings': {
       const fn =
         ref.kind === 'settings' ? 'sync_pull_profile_settings_blob' : 'sync_pull_home_catalog_settings';
-      const rows = await client.rpc<Array<{ settings_json: unknown }>>(fn, {
+      const rows = await client.readRpc<Array<{ settings_json: unknown }>>(fn, {
         p_profile_id: ref.profile_id,
         p_platform: ref.platform,
       });
       return rows[0]?.settings_json ?? {};
     }
     case 'collections': {
-      const rows = await client.rpc<Array<{ collections_json: unknown }>>('sync_pull_collections', {
+      const rows = await client.readRpc<Array<{ collections_json: unknown }>>('sync_pull_collections', {
         p_profile_id: ref.profile_id,
       });
       return rows[0]?.collections_json ?? [];
@@ -264,7 +399,7 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
     case 'library': {
       const all: unknown[] = [];
       for (let offset = 0; offset < MAX_ROWS; offset += PAGE) {
-        const page = await client.rpc<unknown[]>('sync_pull_library', {
+        const page = await client.readRpc<unknown[]>('sync_pull_library', {
           p_profile_id: ref.profile_id,
           p_limit: PAGE,
           p_offset: offset,
@@ -275,11 +410,11 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
       return all;
     }
     case 'watch_progress':
-      return client.rpc('sync_pull_watch_progress', { p_profile_id: ref.profile_id, p_limit: MAX_ROWS });
+      return client.readRpc('sync_pull_watch_progress', { p_profile_id: ref.profile_id, p_limit: PAGE });
     case 'watch_history': {
       const all: unknown[] = [];
       for (let page = 1; (page - 1) * PAGE < MAX_ROWS; page += 1) {
-        const rows = await client.rpc<unknown[]>('sync_pull_watched_items', {
+        const rows = await client.readRpc<unknown[]>('sync_pull_watched_items', {
           p_profile_id: ref.profile_id,
           p_page: page,
           p_page_size: PAGE,
@@ -290,21 +425,21 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
       return all;
     }
     case 'provider_credentials':
-      return client.rpc('sync_pull_provider_credentials', { p_profile_id: ref.profile_id });
+      return client.readRpc('sync_pull_provider_credentials', { p_profile_id: ref.profile_id });
     case 'tracker_tokens':
-      return client.rpc('get_tracker_tokens', { p_profile_id: ref.profile_id });
+      return client.readRpc('get_tracker_tokens', { p_profile_id: ref.profile_id });
     case 'tracker_settings':
-      return client.rpc('get_profile_tracker_settings', { p_profile_id: ref.profile_id });
+      return client.readRpc('get_profile_tracker_settings', { p_profile_id: ref.profile_id });
     case 'profile_setup': {
       const settings: Record<string, unknown> = {};
       for (const platform of ['tv', 'mobile', 'desktop']) {
-        const rows = await client.rpc<Array<{ settings_json: unknown }>>('sync_pull_profile_settings_blob', {
-          p_profile_id: ref.profile_id,
-          p_platform: platform,
-        });
+        const rows = await client.readRpc<Array<{ settings_json: unknown }>>(
+          'sync_pull_profile_settings_blob',
+          { p_profile_id: ref.profile_id, p_platform: platform }
+        );
         settings[platform] = rows[0]?.settings_json ?? null;
       }
-      const providerCredentials = await client.rpc('sync_pull_provider_credentials', {
+      const providerCredentials = await client.readRpc('sync_pull_provider_credentials', {
         p_profile_id: ref.profile_id,
       });
       return { settings, provider_credentials: providerCredentials };
@@ -314,13 +449,63 @@ export async function readResource(client: NuvioClient, ref: ResourceRef): Promi
   }
 }
 
-export async function restore(client: NuvioClient, cfg: NuvioConfig, snapshot: Snapshot): Promise<string> {
+export interface RestoreOutcome {
+  resource: string;
+  profile_id?: number;
+  platform?: string;
+  ok: boolean;
+  message: string;
+}
+
+export interface RestoreReport {
+  ok: boolean;
+  outcomes: RestoreOutcome[];
+}
+
+function outcomeOf(entry: SnapshotResourceEntry, ok: boolean, message: string): RestoreOutcome {
+  const r = entry.resource as { kind: string; profile_id?: number; platform?: string };
+  return { resource: r.kind, profile_id: r.profile_id, platform: r.platform, ok, message };
+}
+
+/**
+ * Restore the state captured by a snapshot. Works for single and composite
+ * snapshots and reports every resource individually — a partial rollback is
+ * never hidden.
+ */
+export async function restore(
+  client: NuvioClient,
+  cfg: NuvioConfig,
+  snapshot: Snapshot
+): Promise<RestoreReport> {
+  if (!snapshot.reversible) {
+    throw new NuvioError(`Snapshot ${snapshot.id} (${snapshot.tool}) cannot be reverted automatically.`);
+  }
+  const entries = snapshotResources(snapshot);
+  if (entries.length === 0) throw new NuvioError(`Snapshot ${snapshot.id} has no resources to restore.`);
+  const outcomes: RestoreOutcome[] = [];
+  for (const entry of entries) {
+    try {
+      const message = await restoreResource(client, cfg, entry, snapshot);
+      outcomes.push(outcomeOf(entry, true, message));
+    } catch (error) {
+      outcomes.push(outcomeOf(entry, false, error instanceof Error ? error.message : String(error)));
+    }
+  }
+  return { ok: outcomes.every((o) => o.ok), outcomes };
+}
+
+export async function restoreResource(
+  client: NuvioClient,
+  cfg: NuvioConfig,
+  entry: SnapshotResourceEntry,
+  snapshot: Snapshot
+): Promise<string> {
   if (!snapshot.reversible) {
     throw new NuvioError(`Snapshot ${snapshot.id} (${snapshot.tool}) cannot be reverted automatically.`);
   }
   const origin = cfg.originClientId;
-  const r = snapshot.resource;
-  const before = snapshot.before;
+  const r = entry.resource;
+  const before = entry.before;
 
   switch (r.kind) {
     case 'profiles': {
@@ -584,11 +769,20 @@ function secondsUntil(expiresAt: unknown): number {
 }
 
 export function describe(s: Snapshot): string {
-  const target = 'profile_id' in s.resource ? ` profile ${s.resource.profile_id}` : '';
-  const platform = 'platform' in s.resource ? `/${s.resource.platform}` : '';
+  const entries = snapshotResources(s);
+  const where = s.composite
+    ? ` ${entries.length} resources [${[...new Set(entries.map((e) => e.resource.kind))].join(', ')}]`
+    : (() => {
+        const r = entries[0]?.resource as
+          { kind?: string; profile_id?: number; platform?: string } | undefined;
+        if (!r) return '';
+        const target = r.profile_id !== undefined ? ` profile ${r.profile_id}` : '';
+        const platform = r.platform ? `/${r.platform}` : '';
+        return ` -> ${r.kind}${target}${platform}`;
+      })();
   const flags =
     (s.reversible ? '' : ' [not reversible]') +
     (s.sensitive ? ' [sensitive]' : '') +
     (s.note ? ` — ${s.note}` : '');
-  return `${s.id}  ${s.ts}  ${s.tool} -> ${s.resource.kind}${target}${platform}${flags}`;
+  return `${s.id}  ${s.ts}  ${s.tool}${where}${flags}`;
 }

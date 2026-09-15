@@ -57,7 +57,7 @@ export function registerTrackerTools(server: McpServer, client: NuvioClient, cfg
       row_order: z.array(z.string()).optional(),
       send_progress: z.boolean().optional(),
     },
-    handler: (args) =>
+    handler: (args, ctx) =>
       setTrackerSettings(
         client,
         args.profile_id,
@@ -67,7 +67,7 @@ export function registerTrackerTools(server: McpServer, client: NuvioClient, cfg
           row_order: args.row_order,
           send_progress: args.send_progress,
         },
-        true
+        ctx.apply
       ),
   });
 
@@ -87,7 +87,7 @@ export function registerTrackerTools(server: McpServer, client: NuvioClient, cfg
       tracker_user_id: z.string().optional(),
       username: z.string().optional(),
     },
-    handler: (args) =>
+    handler: (args, ctx) =>
       setTrackerToken(
         client,
         args.profile_id,
@@ -99,7 +99,7 @@ export function registerTrackerTools(server: McpServer, client: NuvioClient, cfg
           tracker_user_id: args.tracker_user_id,
           username: args.username,
         },
-        true
+        ctx.apply
       ),
   });
 

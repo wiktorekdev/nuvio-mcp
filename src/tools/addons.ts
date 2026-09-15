@@ -62,7 +62,7 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
       enabled: z.boolean().optional().default(true),
       sort_order: z.number().int().optional(),
     },
-    handler: (args) => addons.addAddon(client, args.profile_id, args, originId, true),
+    handler: (args, ctx) => addons.addAddon(client, args.profile_id, args, originId, ctx.apply),
   });
 
   defineMutation(server, client, cfg, {
@@ -79,34 +79,11 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
       enabled: z.boolean().optional(),
       sort_order: z.number().int().optional(),
     },
-    handler: (args) => {
+    handler: (args, ctx) => {
       if (!args.url && !args.id) throw new NuvioError('Provide either url or id to identify the addon.');
       const { profile_id, url, id, ...changes } = args;
-      return addons.updateAddon(client, profile_id, { url, id }, changes, originId, true);
+      return addons.updateAddon(client, profile_id, { url, id }, changes, originId, ctx.apply);
     },
-  });
-
-  defineMutation(server, client, cfg, {
-    name: 'nuvio_toggle_addon',
-    title: 'Enable or disable an addon',
-    description: 'Turn one addon on or off for a profile.',
-    risk: 'write',
-    resource: (args) => ({ kind: 'addons', profile_id: args.profile_id }),
-    schema: {
-      profile_id: profile,
-      url: schemeTolerantUrl.optional(),
-      id: z.uuid().optional(),
-      enabled: z.boolean(),
-    },
-    handler: (args) =>
-      addons.updateAddon(
-        client,
-        args.profile_id,
-        { url: args.url, id: args.id },
-        { enabled: args.enabled },
-        originId,
-        true
-      ),
   });
 
   defineMutation(server, client, cfg, {
@@ -120,7 +97,8 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
       profile_id: profile,
       ordered_urls: z.array(schemeTolerantUrl).min(1),
     },
-    handler: (args) => addons.reorderAddons(client, args.profile_id, args.ordered_urls, originId, true),
+    handler: (args, ctx) =>
+      addons.reorderAddons(client, args.profile_id, args.ordered_urls, originId, ctx.apply),
   });
 
   defineMutation(server, client, cfg, {
@@ -138,5 +116,30 @@ export function registerAddonTools(server: McpServer, client: NuvioClient, cfg: 
       if (!args.url && !args.id) throw new NuvioError('Provide either url or id to identify the addon.');
       return addons.removeAddon(client, args.profile_id, { url: args.url, id: args.id }, originId, ctx.apply);
     },
+  });
+
+  defineMutation(server, client, cfg, {
+    name: 'nuvio_toggle_addon',
+    title: 'Enable or disable an addon',
+    canonical: false,
+    replacement: 'nuvio_update_addon',
+    description: 'Turn one addon on or off for a profile.',
+    risk: 'write',
+    resource: (args) => ({ kind: 'addons', profile_id: args.profile_id }),
+    schema: {
+      profile_id: profile,
+      url: schemeTolerantUrl.optional(),
+      id: z.uuid().optional(),
+      enabled: z.boolean(),
+    },
+    handler: (args, ctx) =>
+      addons.updateAddon(
+        client,
+        args.profile_id,
+        { url: args.url, id: args.id },
+        { enabled: args.enabled },
+        originId,
+        ctx.apply
+      ),
   });
 }

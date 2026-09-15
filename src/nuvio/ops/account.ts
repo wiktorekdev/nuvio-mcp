@@ -6,11 +6,11 @@ export async function getAccount(client: NuvioClient): Promise<unknown> {
 }
 
 export async function getSyncOverview(client: NuvioClient): Promise<SyncOverview> {
-  return client.rpc<SyncOverview>('get_sync_overview', {});
+  return client.readRpc<SyncOverview>('get_sync_overview', {});
 }
 
 export async function listAvatars(client: NuvioClient): Promise<unknown[]> {
-  return client.rpc('get_avatar_catalog', {});
+  return client.readRpc('get_avatar_catalog', {});
 }
 
 export async function exportBackup(client: NuvioClient): Promise<unknown> {
@@ -18,7 +18,7 @@ export async function exportBackup(client: NuvioClient): Promise<unknown> {
 }
 
 export async function health(client: NuvioClient): Promise<unknown> {
-  return client.rpc('health_ping', {});
+  return client.readRpc('health_ping', {});
 }
 
 export async function restoreBackup(

@@ -4,17 +4,64 @@ import type { NuvioClient } from '../nuvio/client.js';
 import type { NuvioConfig } from '../config.js';
 import { NuvioError } from '../nuvio/errors.js';
 import { maskDeep } from '../mask.js';
-import { defineRead } from './helpers.js';
+import { defineLocalMutation, defineRead } from './helpers.js';
 import {
   capture,
+  captureComposite,
   describe,
   findLastChange,
   findLastUndo,
   getSnapshot,
   listSnapshots,
+  pruneSnapshots,
   readResource,
   restore,
+  snapshotResources,
+  type Snapshot,
+  type SnapshotResourceEntry,
 } from '../nuvio/snapshots.js';
+
+async function captureBefore(
+  client: NuvioClient,
+  cfg: NuvioConfig,
+  tool: string,
+  snapshot: Snapshot
+): Promise<void> {
+  if (cfg.disableSnapshots) return;
+  const entries: SnapshotResourceEntry[] = [];
+  for (const entry of snapshotResources(snapshot)) {
+    entries.push({ resource: entry.resource, before: await readResource(client, entry.resource) });
+  }
+  if (entries.length === 0) return;
+  if (entries.length === 1) {
+    capture(cfg, client, {
+      tool,
+      resource: entries[0].resource,
+      before: entries[0].before,
+      reversible: true,
+      note: `state before ${tool === 'nuvio_undo' ? 'undoing' : 'redoing'} ${snapshot.id}`,
+    });
+  } else {
+    captureComposite(cfg, client, {
+      tool,
+      entries,
+      reversible: true,
+      note: `state before ${tool === 'nuvio_undo' ? 'undoing' : 'redoing'} ${snapshot.id}`,
+    });
+  }
+}
+
+function formatReport(report: {
+  ok: boolean;
+  outcomes: Array<{ resource: string; profile_id?: number; platform?: string; ok: boolean; message: string }>;
+}): string {
+  return report.outcomes
+    .map((o) => {
+      const where = `${o.resource}${o.profile_id !== undefined ? ` profile ${o.profile_id}` : ''}${o.platform ? `/${o.platform}` : ''}`;
+      return `${o.ok ? '✓' : '✗'} ${where}: ${o.message}`;
+    })
+    .join('\n');
+}
 
 export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
   defineRead(server, client, cfg, {
@@ -44,11 +91,14 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
         id: snapshot.id,
         ts: snapshot.ts,
         tool: snapshot.tool,
-        resource: snapshot.resource,
+        composite: snapshot.composite ?? false,
+        resources: snapshotResources(snapshot).map((e) => ({
+          resource: e.resource,
+          before: maskDeep(e.before),
+        })),
         reversible: snapshot.reversible,
         sensitive: snapshot.sensitive,
         note: snapshot.note,
-        before: maskDeep(snapshot.before),
       };
     },
   });
@@ -57,7 +107,8 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
     name: 'nuvio_undo',
     title: 'Undo a change',
     description:
-      'Revert a previous change using its snapshot. Defaults to the most recent change. Snapshots the current state first, so an undo can itself be undone.',
+      'Revert a previous change using its snapshot (single or composite). Defaults to the most recent change. ' +
+      'Snapshots the current state first, so an undo can itself be undone.',
     risk: 'write',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     schema: {
@@ -78,21 +129,16 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
           `Snapshot ${target.id} (${target.tool}) is not reversible${target.note ? ` — ${target.note}` : ''}.`
         );
       }
-      if (!cfg.disableSnapshots) {
-        const current = await readResource(client, target.resource);
-        capture(cfg, client, {
-          tool: 'nuvio_undo',
-          resource: target.resource,
-          before: current,
-          reversible: true,
-          note: `state before undoing ${target.id}`,
-        });
-      }
-      const message = await restore(client, cfg, target);
+      await captureBefore(client, cfg, 'nuvio_undo', target);
+      const report = await restore(client, cfg, target);
       const suffix = cfg.disableSnapshots
         ? ' Snapshots are disabled, so this undo cannot itself be undone.'
         : '';
-      return `${message} Reverted snapshot ${target.id} (${target.tool}).${suffix}`;
+      const failed = report.outcomes.filter((o) => !o.ok).length;
+      return (
+        `${report.ok ? 'Reverted' : `Partially reverted (${failed} failed)`} snapshot ${target.id} (${target.tool}).` +
+        `\n${formatReport(report)}${suffix}`
+      );
     },
   });
 
@@ -107,19 +153,43 @@ export function registerUndoTools(server: McpServer, client: NuvioClient, cfg: N
     handler: async () => {
       const target = findLastUndo(cfg);
       if (!target) throw new NuvioError('There is nothing to redo.');
-      if (!cfg.disableSnapshots) {
-        const current = await readResource(client, target.resource);
-        capture(cfg, client, {
-          tool: 'nuvio_redo',
-          resource: target.resource,
-          before: current,
-          reversible: true,
-          note: `state before redoing ${target.id}`,
-        });
-      }
-      const message = await restore(client, cfg, target);
+      await captureBefore(client, cfg, 'nuvio_redo', target);
+      const report = await restore(client, cfg, target);
       const suffix = cfg.disableSnapshots ? ' Snapshot writing is disabled; this redo was not recorded.' : '';
-      return `${message} Re-applied snapshot ${target.id}.${suffix}`;
+      const failed = report.outcomes.filter((o) => !o.ok).length;
+      return (
+        `${report.ok ? 'Re-applied' : `Partially re-applied (${failed} failed)`} snapshot ${target.id}.` +
+        `\n${formatReport(report)}${suffix}`
+      );
+    },
+  });
+
+  defineLocalMutation(server, client, cfg, {
+    name: 'nuvio_prune_snapshots',
+    title: 'Prune snapshots',
+    description:
+      'Delete old snapshot files according to retention limits (age, count, total size). Local-only; defaults to dry_run.',
+    risk: 'destructive',
+    schema: {
+      older_than_days: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Delete snapshots older than N days (0 disables).'),
+      keep_last: z.number().int().min(0).optional().describe('Always keep the newest N snapshots.'),
+      max_total_bytes: z.number().int().min(0).optional().describe('Keep total snapshot bytes under this.'),
+    },
+    handler: async (args, ctx) => {
+      const result = pruneSnapshots(cfg, {
+        olderThanDays: args.older_than_days,
+        keepLast: args.keep_last,
+        maxCount: 0,
+        maxTotalBytes: args.max_total_bytes,
+        dryRun: !ctx.apply,
+      });
+      const diff = result.removed.map((r) => `- ${r.id} (${r.reason}, ${r.bytes} bytes)`);
+      return { changed: result.removed.length > 0, applied: ctx.apply, diff };
     },
   });
 }

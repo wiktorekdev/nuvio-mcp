@@ -23,7 +23,13 @@ test('lists tools and describes capabilities', async () => {
   for (const required of [
     'nuvio_list_profiles',
     'nuvio_reorder_addons',
-    'nuvio_set_setting',
+    'nuvio_update_settings',
+    'nuvio_apply_plan',
+    'nuvio_copy_setup',
+    'nuvio_update_plugin',
+    'nuvio_add_to_watch_history',
+    'nuvio_prune_snapshots',
+    'nuvio_test_provider_credential',
     'nuvio_set_provider_credential',
     'nuvio_link_tracker',
     'nuvio_add_to_library',
@@ -35,6 +41,25 @@ test('lists tools and describes capabilities', async () => {
   const caps = JSON.parse((await mcp.call('nuvio_capabilities')).replace(/```json|```/g, ''));
   assert.equal(caps.undo.automatic, true);
   assert.equal(caps.account_deletion, 'not supported by design');
+  assert.equal(caps.canonical_tool_count, 65, 'canonical tool surface must be exactly 65');
+  const canonicalNames = caps.tools.map((t) => t.name);
+  assert.equal(canonicalNames.length, 65);
+  for (const deprecated of [
+    'nuvio_toggle_addon',
+    'nuvio_toggle_plugin',
+    'nuvio_set_setting',
+    'nuvio_unset_setting',
+    'nuvio_set_home_catalog_path',
+    'nuvio_copy_settings',
+    'nuvio_copy_profile_setup',
+    'nuvio_mark_watched',
+  ]) {
+    assert.ok(
+      caps.deprecated_tools.some((t) => t.name === deprecated),
+      `expected ${deprecated} deprecated`
+    );
+    assert.ok(!canonicalNames.includes(deprecated), `${deprecated} must not be canonical`);
+  }
 });
 
 test('list profiles and addons', async () => {
@@ -118,6 +143,45 @@ test('nested settings set/get/unset', async () => {
   assert.equal(settings.settings_json.features.player_settings.auto_play_next, undefined);
 });
 
+test('update_settings deep-merges patch, applies set/unset, and replaces arrays', async () => {
+  const out = await mcp.call('nuvio_update_settings', {
+    profile_id: 1,
+    platform: 'tv',
+    patch: { features: { player_settings: { subtitle_language: 'pl' } } },
+    set: [{ path: 'features.theme_settings.selected_theme', value: 'DARK' }],
+  });
+  assert.match(out, /Applied/);
+  let settings = JSON.parse(
+    (await mcp.call('nuvio_get_settings', { profile_id: 1, platform: 'tv' })).replace(/```json|```/g, '')
+  );
+  // Deep merge preserved the sibling theme + existing player keys.
+  assert.equal(settings.settings_json.theme, 'dark', 'sibling top-level key preserved');
+  assert.equal(settings.settings_json.features.player_settings.subtitle_language, 'pl');
+  assert.equal(settings.settings_json.features.theme_settings.selected_theme, 'DARK');
+
+  // Array replacement.
+  await mcp.call('nuvio_update_settings', {
+    profile_id: 1,
+    platform: 'tv',
+    patch: { features: { player_settings: { order: [3, 2, 1] } } },
+  });
+  settings = JSON.parse(
+    (await mcp.call('nuvio_get_settings', { profile_id: 1, platform: 'tv' })).replace(/```json|```/g, '')
+  );
+  assert.deepEqual(settings.settings_json.features.player_settings.order, [3, 2, 1]);
+
+  // unset removes the key.
+  await mcp.call('nuvio_update_settings', {
+    profile_id: 1,
+    platform: 'tv',
+    unset: ['features.player_settings.order'],
+  });
+  settings = JSON.parse(
+    (await mcp.call('nuvio_get_settings', { profile_id: 1, platform: 'tv' })).replace(/```json|```/g, '')
+  );
+  assert.equal(settings.settings_json.features.player_settings.order, undefined);
+});
+
 test('copy settings between platforms', async () => {
   await mcp.call('nuvio_copy_settings', {
     from_profile_id: 1,
@@ -190,21 +254,31 @@ test('collections create, duplicate, reorder, delete', async () => {
 test('library, progress and history mutations', async () => {
   await mcp.call('nuvio_add_to_library', {
     profile_id: 1,
-    item: { content_id: 'tt1', content_type: 'movie', name: 'Movie One' },
+    items: [{ content_id: 'tt1', content_type: 'movie', name: 'Movie One' }],
   });
   assert.match(await mcp.call('nuvio_get_library', { profile_id: 1 }), /tt1/);
 
   await mcp.call('nuvio_set_watch_progress', {
     profile_id: 1,
-    entry: { content_id: 'tt1', content_type: 'movie', position: 10, duration: 100 },
+    entries: [{ content_id: 'tt1', content_type: 'movie', position: 10, duration: 100 }],
   });
   assert.match(await mcp.call('nuvio_get_watch_progress', { profile_id: 1 }), /tt1/);
 
-  await mcp.call('nuvio_mark_watched', {
+  await mcp.call('nuvio_add_to_watch_history', {
     profile_id: 1,
-    item: { content_id: 'tt1', content_type: 'movie', title: 'Movie One' },
+    items: [{ content_id: 'tt1', content_type: 'movie', title: 'Movie One' }],
   });
   assert.match(await mcp.call('nuvio_get_watch_history', { profile_id: 1 }), /tt1/);
+
+  // Idempotency: a repeated identical history upsert must not duplicate the row.
+  await mcp.call('nuvio_add_to_watch_history', {
+    profile_id: 1,
+    items: [{ content_id: 'tt1', content_type: 'movie', title: 'Movie One' }],
+  });
+  const history = JSON.parse(
+    (await mcp.call('nuvio_get_watch_history', { profile_id: 1 })).replace(/```json|```/g, '')
+  );
+  assert.equal(history.filter((h) => h.content_id === 'tt1').length, 1, 'watch history must be idempotent');
 
   await mcp.call('nuvio_remove_from_library', {
     profile_id: 1,
@@ -241,7 +315,7 @@ test('trackers link, list masked, settings, unlink', async () => {
 test('library/progress/history changes are precisely undoable', async () => {
   await mcp.call('nuvio_add_to_library', {
     profile_id: 1,
-    item: { content_id: 'tt-undo', content_type: 'movie', name: 'Undo Me' },
+    items: [{ content_id: 'tt-undo', content_type: 'movie', name: 'Undo Me' }],
   });
   assert.match(await mcp.call('nuvio_get_library', { profile_id: 1 }), /tt-undo/);
   await mcp.call('nuvio_undo');
@@ -249,15 +323,15 @@ test('library/progress/history changes are precisely undoable', async () => {
 
   await mcp.call('nuvio_set_watch_progress', {
     profile_id: 1,
-    entry: { content_id: 'tt-prog', content_type: 'movie', position: 5, duration: 50 },
+    entries: [{ content_id: 'tt-prog', content_type: 'movie', position: 5, duration: 50 }],
   });
   assert.match(await mcp.call('nuvio_get_watch_progress', { profile_id: 1 }), /tt-prog/);
   await mcp.call('nuvio_undo');
   assert.doesNotMatch(await mcp.call('nuvio_get_watch_progress', { profile_id: 1 }), /tt-prog/);
 
-  await mcp.call('nuvio_mark_watched', {
+  await mcp.call('nuvio_add_to_watch_history', {
     profile_id: 1,
-    item: { content_id: 'tt-hist', content_type: 'movie', title: 'History' },
+    items: [{ content_id: 'tt-hist', content_type: 'movie', title: 'History' }],
   });
   assert.match(await mcp.call('nuvio_get_watch_history', { profile_id: 1 }), /tt-hist/);
   await mcp.call('nuvio_undo');
@@ -443,7 +517,7 @@ test('expired confirmation tokens are rejected', async () => {
 });
 
 test('profile create then undo removes the surplus profile', async () => {
-  await mcp.call('nuvio_create_profile', { name: 'Temp', profile_index: 3 });
+  await mcp.call('nuvio_create_profile', { name: 'Temp', profile_id: 3 });
   assert.match(await mcp.call('nuvio_list_profiles'), /Temp/);
   await mcp.call('nuvio_undo');
   assert.doesNotMatch(await mcp.call('nuvio_list_profiles'), /Temp/);
@@ -532,7 +606,7 @@ test('profile PIN is masked in output, confirmation token and audit log', async 
   const path = await import('node:path');
   const pin = 's3cretPIN';
 
-  const preview = await mcp.call('nuvio_set_profile_pin', { profile_index: 1, pin });
+  const preview = await mcp.call('nuvio_set_profile_pin', { profile_id: 1, pin });
   assert.ok(!preview.includes(pin), 'PIN must not appear in the preview');
   const token = confirmationToken(preview);
   assert.ok(token, 'preview must include a confirmation token');
@@ -540,7 +614,7 @@ test('profile PIN is masked in output, confirmation token and audit log', async 
   assert.ok(!body.includes(pin), 'PIN must not be readable from the confirmation token');
 
   const applied = await mcp.call('nuvio_set_profile_pin', {
-    profile_index: 1,
+    profile_id: 1,
     pin,
     confirmation_token: token,
   });

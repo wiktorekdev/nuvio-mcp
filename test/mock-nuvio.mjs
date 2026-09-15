@@ -67,6 +67,17 @@ const json = (res, status, body) => {
 
 export function startMockNuvio() {
   const store = seed();
+  const counts = {};
+  const failures = new Map();
+  const bump = (name) => {
+    counts[name] = (counts[name] ?? 0) + 1;
+  };
+  const injected = (name) => {
+    const remaining = failures.get(name) ?? 0;
+    if (remaining <= 0) return null;
+    failures.set(name, remaining - 1);
+    return { status: 503, body: { message: `injected failure for ${name}` } };
+  };
 
   const rpc = {
     sync_pull_profiles: () => store.profiles,
@@ -330,6 +341,9 @@ export function startMockNuvio() {
         const name = url.pathname.split('/').pop();
         const handler = rpc[name];
         if (!handler) return json(res, 404, { code: 'PGRST202', message: `Could not find function ${name}` });
+        bump(name);
+        const failure = injected(name);
+        if (failure) return json(res, failure.status, failure.body);
         try {
           const args = body ? JSON.parse(body) : {};
           const result = handler(args);
@@ -341,6 +355,7 @@ export function startMockNuvio() {
       if (url.pathname === '/rest/v1/addons' || url.pathname === '/rest/v1/plugins') {
         const table = url.pathname.endsWith('addons') ? store.addons : store.plugins;
         const profile = Number(url.searchParams.get('profile_id')?.replace('eq.', '') ?? 1);
+        bump(url.pathname.endsWith('addons') ? 'select:addons' : 'select:plugins');
         return json(res, 200, table[profile] ?? []);
       }
       json(res, 404, { message: 'not found' });
@@ -350,7 +365,17 @@ export function startMockNuvio() {
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
-      resolve({ url: `http://127.0.0.1:${port}`, store, close: () => new Promise((r) => server.close(r)) });
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        store,
+        close: () => new Promise((r) => server.close(r)),
+        stats: () => ({ ...counts }),
+        resetStats: () => {
+          for (const key of Object.keys(counts)) delete counts[key];
+        },
+        failRpc: (name, times = 1) => failures.set(name, times),
+        clearFailures: () => failures.clear(),
+      });
     });
   });
 }

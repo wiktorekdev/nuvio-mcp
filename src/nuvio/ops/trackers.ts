@@ -31,14 +31,14 @@ function assertTracker(tracker: string): string {
 }
 
 export async function listTrackerTokens(client: NuvioClient, profileId: number): Promise<TrackerToken[]> {
-  return client.rpc<TrackerToken[]>('get_tracker_tokens', { p_profile_id: profileId });
+  return client.readRpc<TrackerToken[]>('get_tracker_tokens', { p_profile_id: profileId });
 }
 
 export async function listTrackerSettings(
   client: NuvioClient,
   profileId: number
 ): Promise<TrackerSettings[]> {
-  return client.rpc<TrackerSettings[]>('get_profile_tracker_settings', { p_profile_id: profileId });
+  return client.readRpc<TrackerSettings[]>('get_profile_tracker_settings', { p_profile_id: profileId });
 }
 
 export async function setTrackerSettings(

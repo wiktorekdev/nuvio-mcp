@@ -8,6 +8,7 @@ import {
   listProviderCredentials,
   setProviderCredential,
   deleteProviderCredential,
+  testProviderCredential,
 } from '../nuvio/ops/providers.js';
 
 export function registerProviderTools(server: McpServer, client: NuvioClient, cfg: NuvioConfig): void {
@@ -48,8 +49,22 @@ export function registerProviderTools(server: McpServer, client: NuvioClient, cf
       provider: z.string().describe('One of the supported provider ids'),
       api_key: z.string().min(1).describe('API key / client id value'),
     },
-    handler: (args) =>
-      setProviderCredential(client, args.profile_id, args.provider, args.api_key, originId, true),
+    handler: (args, ctx) =>
+      setProviderCredential(client, args.profile_id, args.provider, args.api_key, originId, ctx.apply),
+  });
+
+  defineRead(server, client, cfg, {
+    name: 'nuvio_test_provider_credential',
+    title: 'Test a provider credential',
+    description:
+      'Verify a provider credential without storing it. The secret is never returned or logged; the result ' +
+      'reports format validity and, where the provider exposes a cheap endpoint, a live check.',
+    risk: 'read',
+    schema: {
+      provider: z.string().describe('One of the supported provider ids'),
+      api_key: z.string().min(1).describe('API key / client id value to verify'),
+    },
+    handler: (args) => testProviderCredential(args.provider, args.api_key),
   });
 
   defineMutation(server, client, cfg, {

@@ -1,6 +1,119 @@
 import { NuvioError } from '../errors.js';
 import type { NuvioClient } from '../client.js';
 import type { ApplyResult, Profile } from '../types.js';
+import { deepMerge } from './settings.js';
+
+export const SETUP_PLATFORMS = ['tv', 'mobile', 'desktop'] as const;
+export type SetupPlatform = (typeof SETUP_PLATFORMS)[number];
+
+export interface CopySetupInput {
+  source_profile_id: number;
+  target_profile_id: number;
+  platforms?: string[];
+  settings_mode?: 'merge' | 'replace';
+  provider_credentials?: 'none' | 'merge' | 'replace';
+}
+
+async function readPlatformSettings(
+  client: NuvioClient,
+  profileId: number,
+  platform: string
+): Promise<Record<string, unknown> | null> {
+  const rows = await client.readRpc<Array<{ settings_json: unknown }>>('sync_pull_profile_settings_blob', {
+    p_profile_id: profileId,
+    p_platform: platform,
+  });
+  return (rows[0]?.settings_json as Record<string, unknown>) ?? null;
+}
+
+async function readCredentials(
+  client: NuvioClient,
+  profileId: number
+): Promise<Array<{ provider: string; credential_json: unknown }>> {
+  return client.readRpc('sync_pull_provider_credentials', { p_profile_id: profileId });
+}
+
+/**
+ * Copy a profile's setup to another profile: per-platform settings (deep-merged
+ * or replaced) and optionally provider credentials (merged or replaced).
+ */
+export async function copySetup(
+  client: NuvioClient,
+  input: CopySetupInput,
+  originId: string,
+  apply: boolean
+): Promise<ApplyResult<Record<string, unknown>>> {
+  const source = input.source_profile_id;
+  const target = input.target_profile_id;
+  if (source === target) throw new NuvioError('Source and target profile must differ.');
+  const platforms = input.platforms?.length ? input.platforms : [...SETUP_PLATFORMS];
+  const mode = input.settings_mode ?? 'merge';
+  const credMode = input.provider_credentials ?? 'none';
+
+  const before: Record<string, unknown> = { settings: {}, provider_credentials: [] };
+  const after: Record<string, unknown> = { settings: {}, provider_credentials: [] };
+  const diff: string[] = [];
+
+  for (const platform of platforms) {
+    const src = await readPlatformSettings(client, source, platform);
+    const tgt = await readPlatformSettings(client, target, platform);
+    (before.settings as Record<string, unknown>)[platform] = tgt;
+    if (src === null) continue;
+    const next = mode === 'replace' ? src : (deepMerge(tgt ?? {}, src) as Record<string, unknown>);
+    (after.settings as Record<string, unknown>)[platform] = next;
+    if (JSON.stringify(tgt) !== JSON.stringify(next)) {
+      diff.push(`~ ${platform} settings (${mode}) on profile ${target}`);
+    }
+  }
+
+  const pushCredentials: Array<{ provider: string; credential_json: unknown }> = [];
+  const deleteProviders: string[] = [];
+  if (credMode !== 'none') {
+    const srcCreds = await readCredentials(client, source);
+    const tgtCreds = await readCredentials(client, target);
+    before.provider_credentials = tgtCreds;
+    const tgtByProvider = new Map(tgtCreds.map((c) => [c.provider, c]));
+    if (credMode === 'replace') {
+      const wanted = new Set(srcCreds.map((c) => c.provider));
+      for (const cred of tgtCreds) if (!wanted.has(cred.provider)) deleteProviders.push(cred.provider);
+    }
+    for (const cred of srcCreds) pushCredentials.push(cred);
+    after.provider_credentials = srcCreds;
+    if (pushCredentials.length > 0) {
+      diff.push(`~ provider credentials (${credMode}): ${pushCredentials.map((c) => c.provider).join(', ')}`);
+    }
+    for (const provider of deleteProviders) diff.push(`- provider credential ${provider}`);
+    void tgtByProvider;
+  }
+
+  if (apply && diff.length > 0) {
+    for (const [platform, json] of Object.entries(after.settings as Record<string, unknown>)) {
+      if (!(platform in (before.settings as Record<string, unknown>))) continue;
+      await client.rpc('sync_push_profile_settings_blob', {
+        p_profile_id: target,
+        p_platform: platform,
+        p_settings_json: json,
+        p_origin_client_id: originId,
+      });
+    }
+    for (const provider of deleteProviders) {
+      await client.rpc('sync_delete_provider_credentials', {
+        p_profile_id: target,
+        p_provider: provider,
+        p_origin_client_id: originId,
+      });
+    }
+    if (pushCredentials.length > 0) {
+      await client.rpc('sync_push_provider_credentials', {
+        p_profile_id: target,
+        p_credentials: pushCredentials,
+        p_origin_client_id: originId,
+      });
+    }
+  }
+
+  return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
+}
 
 export interface ProfilePush {
   profile_index: number;
@@ -15,7 +128,7 @@ export interface ProfilePush {
 export const CLIENT_MAX_PROFILES = 6;
 
 export async function listProfiles(client: NuvioClient): Promise<Profile[]> {
-  return client.rpc<Profile[]>('sync_pull_profiles', {});
+  return client.readRpc<Profile[]>('sync_pull_profiles', {});
 }
 
 function toPushShape(profiles: Profile[]): ProfilePush[] {
